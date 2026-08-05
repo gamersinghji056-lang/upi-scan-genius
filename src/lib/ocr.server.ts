@@ -25,7 +25,7 @@ export async function transcribePages(images: string[]): Promise<string> {
         "Lovable-API-Key": apiKey,
       },
       body: JSON.stringify({
-        model: "google/gemini-3-flash",
+        model: "google/gemini-3.6-flash",
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           {
