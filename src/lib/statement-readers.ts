@@ -91,14 +91,14 @@ export type ExtractProgress = (stage: string) => void;
 export async function extractFromFile(
   file: File,
   onProgress?: ExtractProgress,
-): Promise<UpiCredit[]> {
+): Promise<ExtractResult> {
   const name = file.name.toLowerCase();
   const isImage =
     file.type.startsWith("image/") || /\.(jpg|jpeg|png|webp|bmp|tiff?)$/.test(name);
 
   if (isImage) {
     onProgress?.("Reading scanned image…");
-    return parseText(await ocr([await fileToDataUrl(file)]));
+    return parseTextDetailed(await ocr([await fileToDataUrl(file)]));
   }
 
   if (name.endsWith(".pdf") || file.type === "application/pdf") {
@@ -107,21 +107,30 @@ export async function extractFromFile(
     const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
     const { text, sparsePages } = await pdfText(doc);
 
-    let combined = text;
-    if (sparsePages.length) {
-      onProgress?.(`Running OCR on ${sparsePages.length} scanned page(s)…`);
-      const images: string[] = [];
-      for (const p of sparsePages.slice(0, 12)) images.push(await pageToDataUrl(doc, p));
-      combined = `${combined}\n${await ocr(images)}`;
+    const parts: ExtractResult[] = [];
+    if (text.replace(/\s/g, "").length) parts.push(parseTextDetailed(text));
+
+    let ocrPages = sparsePages;
+    // No UPI credit found in the text layer: fall back to OCR of the whole document.
+    if (!ocrPages.length && !(parts[0]?.rows.length ?? 0)) {
+      ocrPages = Array.from({ length: doc.numPages }, (_, i) => i + 1);
     }
-    return parseText(combined);
+
+    if (ocrPages.length) {
+      onProgress?.(`Running OCR on ${Math.min(ocrPages.length, 12)} page(s)…`);
+      const images: string[] = [];
+      for (const p of ocrPages.slice(0, 12)) images.push(await pageToDataUrl(doc, p));
+      parts.push(parseTextDetailed(await ocr(images)));
+    }
+    return mergeResults(parts.length ? parts : [parseTextDetailed("")]);
   }
 
   if (name.endsWith(".xls") || name.endsWith(".xlsx") || name.endsWith(".csv")) {
     onProgress?.("Reading spreadsheet…");
-    return parseRows(await readSheetRows(file));
+    return parseRowsDetailed(await readSheetRows(file));
   }
 
   onProgress?.("Reading text…");
-  return parseText(await file.text());
+  return parseTextDetailed(await file.text());
 }
+
