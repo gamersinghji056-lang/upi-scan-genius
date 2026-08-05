@@ -36,6 +36,7 @@ function Index() {
   const [sourceName, setSourceName] = useState<string | null>(null);
   const [pasted, setPasted] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [stage, setStage] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const runFiles = useCallback(async (files: FileList | File[]) => {
@@ -45,7 +46,7 @@ function Index() {
     setError(null);
     try {
       const all: UpiCredit[] = [];
-      for (const f of list) all.push(...(await extractFromFile(f)));
+      for (const f of list) all.push(...(await extractFromFile(f, setStage)));
       setRows(all);
       setSourceName(list.map((f) => f.name).join(", "));
     } catch (e) {
@@ -53,6 +54,7 @@ function Index() {
       setRows(null);
     } finally {
       setBusy(false);
+      setStage(null);
     }
   }, []);
 
@@ -86,9 +88,8 @@ function Index() {
             UPI Credit Extraction
           </h1>
           <p className="mt-3 max-w-xl text-sm opacity-85 sm:text-base">
-            Drop any Indian bank statement — PDF, CSV, XLS, XLSX or plain text. Only genuine UPI
-            credit transactions are returned: Date, UTR, Amount, Mode. Files never leave your
-            device.
+            Drop any Indian bank statement — text PDF, scanned PDF, photo, CSV, XLS, XLSX or plain text. Only genuine UPI
+            credit transactions are returned: Date, UTR, Amount, Mode. No bank selection, template or mapping needed.
           </p>
         </div>
       </header>
@@ -115,15 +116,15 @@ function Index() {
             ref={inputRef}
             type="file"
             multiple
-            accept=".pdf,.csv,.xls,.xlsx,.txt,.text"
+            accept=".pdf,.csv,.xls,.xlsx,.txt,.text,.jpg,.jpeg,.png,.webp,image/*"
             className="hidden"
             onChange={(e) => e.target.files && void runFiles(e.target.files)}
           />
           <Button className="mt-4" onClick={() => inputRef.current?.click()} disabled={busy}>
             {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-            {busy ? "Parsing…" : "Choose file"}
+            {busy ? (stage ?? "Parsing…") : "Choose file"}
           </Button>
-          <p className="mt-3 text-xs text-muted-foreground">PDF · CSV · XLS · XLSX · TXT</p>
+          <p className="mt-3 text-xs text-muted-foreground">PDF (text or scanned) · CSV · XLS · XLSX · TXT · JPG · PNG · WEBP</p>
         </section>
 
         <section className="rounded-xl border bg-card p-5 shadow-card">
