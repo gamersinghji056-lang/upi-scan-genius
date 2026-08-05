@@ -1,6 +1,7 @@
 import { ocrStatementPages } from "./ocr.functions";
-import type { Row } from "./upi-parser";
-import { parseRows, parseText, type UpiCredit } from "./upi-parser";
+import type { ExtractResult, Row } from "./upi-parser";
+import { mergeResults, parseRowsDetailed, parseTextDetailed } from "./upi-parser";
+
 
 async function loadPdfjs() {
   const pdfjs = await import("pdfjs-dist");
