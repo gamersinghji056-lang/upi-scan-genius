@@ -425,7 +425,7 @@ function analyze(rowsIn: Row[]): ExtractResult {
 function stitchLines(lines: string[]): string[] {
   const out: string[] = [];
   for (const raw of lines) {
-    const line = raw.replace(/[ \t]+/g, " ").trimEnd();
+    const line = raw.replace(/\u00a0/g, " ").trimEnd();
     if (!line.trim()) continue;
     const startsTxn = extractDate(line) !== null;
     if (startsTxn || out.length === 0) out.push(line);
