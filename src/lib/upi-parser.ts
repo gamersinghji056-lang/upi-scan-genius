@@ -320,6 +320,25 @@ function analyze(rowsIn: Row[]): ExtractResult {
     const push = (d: Omit<RowDiagnostic, "index" | "preview">) =>
       diagnostics.push({ index: i, preview: text.slice(0, 160), ...d });
 
+    // Opening / brought-forward balance seeds the running-balance chain.
+    if (/\b(opening\s*balance|balance\s*b\/?f|brought\s*forward|b\/f)\b/i.test(text)) {
+      const t = moneyTokens(text);
+      if (t.length) {
+        prevBalance = toNumber(t[t.length - 1] ?? "");
+        push({
+          hasDate: false,
+          isUpi: false,
+          references: 0,
+          direction: "unknown",
+          amount: null,
+          accepted: false,
+          reason: "Opening balance — chain seeded",
+        });
+        return;
+      }
+    }
+
+
     // Header rows re-train the column map; they are never transactions.
     const maybeHeader = detectColumns(cells);
     if (maybeHeader && !UPI_RE.test(text) && extractDate(text) === null) {
