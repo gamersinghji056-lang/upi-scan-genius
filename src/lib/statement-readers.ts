@@ -9,7 +9,6 @@ async function loadPdfjs() {
   return pdfjs;
 }
 
-type PdfDoc = Awaited<ReturnType<ReturnType<typeof Object>>> extends never ? never : any;
 
 async function pdfText(doc: any): Promise<{ text: string; sparsePages: number[] }> {
   const pages: string[] = [];
