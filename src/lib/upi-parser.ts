@@ -29,27 +29,30 @@ function pad(n: string) {
 
 /** Returns DD/MM/YYYY or null */
 export function extractDate(text: string): string | null {
-  let m = DATE_PATTERNS[0].exec(text);
+  const [dmy, ymd, dMon, dmy2] = DATE_PATTERNS as [RegExp, RegExp, RegExp, RegExp];
+
+  let m = dmy.exec(text);
   if (m) return `${m[1]}/${m[2]}/${m[3]}`;
 
-  m = DATE_PATTERNS[1].exec(text);
+  m = ymd.exec(text);
   if (m) return `${m[3]}/${m[2]}/${m[1]}`;
 
-  m = DATE_PATTERNS[2].exec(text);
+  m = dMon.exec(text);
   if (m) {
-    const mon = MONTHS[m[2].slice(0, 3).toLowerCase()];
+    const mon = MONTHS[(m[2] ?? "").slice(0, 3).toLowerCase()];
     if (mon) {
-      let y = m[3];
+      let y = m[3] ?? "";
       if (y.length === 2) y = Number(y) > 70 ? `19${y}` : `20${y}`;
-      return `${pad(m[1])}/${mon}/${y}`;
+      return `${pad(m[1] ?? "")}/${mon}/${y}`;
     }
   }
 
-  m = DATE_PATTERNS[3].exec(text);
+  m = dmy2.exec(text);
   if (m) return `${m[1]}/${m[2]}/20${m[3]}`;
 
   return null;
 }
+
 
 /** First standalone 12-digit numeric reference in the row. */
 export function extractUtr(text: string): string | null {
