@@ -146,3 +146,15 @@
     color: var(--color-foreground);
   }
 }
+
+@theme inline {
+  --color-surface-ledger: var(--surface-ledger);
+}
+
+@utility bg-header-gradient {
+  background-image: var(--gradient-header);
+}
+
+@utility shadow-card {
+  box-shadow: var(--shadow-card);
+}
