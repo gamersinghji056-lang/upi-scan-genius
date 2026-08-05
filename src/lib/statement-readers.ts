@@ -38,7 +38,7 @@ async function pdfText(doc: any): Promise<{ text: string; sparsePages: number[] 
       );
     const pageText = ordered.join("\n");
     // A text layer with almost no characters means the page is a scan.
-    if (pageText.replace(/\s/g, "").length < 120) sparsePages.push(p);
+    if (pageText.replace(/\s/g, "").length < 200) sparsePages.push(p);
     pages.push(pageText);
   }
 
@@ -55,7 +55,7 @@ async function pageToDataUrl(doc: any, pageNumber: number): Promise<string> {
   if (!ctx) throw new Error("Could not render this PDF page.");
   const scaled = page.getViewport({ scale: (canvas.width / viewport.width) * 2 });
   await page.render({ canvasContext: ctx, viewport: scaled, canvas }).promise;
-  return canvas.toDataURL("image/jpeg", 0.85);
+  return canvas.toDataURL("image/jpeg", 0.92);
 }
 
 async function fileToDataUrl(file: File): Promise<string> {
