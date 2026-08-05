@@ -356,7 +356,7 @@ function analyze(rowsIn: Row[]): ExtractResult {
     }
 
     transactionRows++;
-    const cls = classifyRow(cells, text, cols, prevBalance);
+    const cls = classifyRow(cells, text, rowCols, prevBalance);
     if (cls.balance !== null) prevBalance = cls.balance;
     if (isUpi) upiRows++;
     if (refs.length) rowsWithReference++;
