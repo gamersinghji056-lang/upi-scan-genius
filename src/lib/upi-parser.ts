@@ -200,10 +200,14 @@ function stitchLines(lines: string[]): string[] {
   return out;
 }
 
-/** Pipe-delimited OCR line: date | narration | ref | debit | credit | balance */
+/**
+ * Pipe-delimited line (OCR transcription):
+ * date | narration | [ref] | debit | credit | balance — with empty slots kept.
+ * Slots are identified by content, not by fixed index.
+ */
 function parsePipeRow(line: string): UpiCredit | null {
   const parts = line.split("|").map((p) => p.trim());
-  if (parts.length < 5) return null;
+  if (parts.length < 4) return null;
   const joined = parts.join(" ");
   if (!UPI_RE.test(joined)) return null;
 
@@ -212,15 +216,40 @@ function parsePipeRow(line: string): UpiCredit | null {
   const date = extractDate(parts[0] || "") ?? extractDate(joined);
   if (!date) return null;
 
-  const debit = moneyTokens(parts[3] || "");
-  const credit = moneyTokens(parts[4] || "");
-  if (debit.length && toNumber(debit[debit.length - 1] ?? "0") > 0) return null;
-  if (!credit.length) return null;
-  const amount = toNumber(credit[credit.length - 1] ?? "0");
+  const moneyIdx: number[] = [];
+  parts.forEach((p, i) => {
+    if (i === 0) return;
+    if (moneyTokens(p).length && /\d/.test(p) && !UPI_RE.test(p)) moneyIdx.push(i);
+  });
+  if (moneyIdx.length < 2) return null;
+
+  // Last money slot is the running balance.
+  const valueIdx = moneyIdx.slice(0, -1);
+  let creditIdx: number | null = null;
+
+  if (valueIdx.length === 1) {
+    const i = valueIdx[0] as number;
+    const before = (parts[i - 1] ?? "x").length === 0;
+    const after = (parts[i + 1] ?? "x").length === 0;
+    if (before && !after) creditIdx = i;
+    else if (after && !before) creditIdx = null;
+    else if (CREDIT_RE.test(joined) && !DEBIT_RE.test(joined)) creditIdx = i;
+  } else {
+    // Both debit and credit slots carry a value: later slot is the credit column.
+    const last = valueIdx[valueIdx.length - 1] as number;
+    const prev = valueIdx[valueIdx.length - 2] as number;
+    if (toNumber(moneyTokens(parts[prev] ?? "")[0] ?? "0") > 0) return null;
+    creditIdx = last;
+  }
+
+  if (creditIdx === null) return null;
+  const tokens = moneyTokens(parts[creditIdx] ?? "");
+  const amount = toNumber(tokens[tokens.length - 1] ?? "0");
   if (!amount || amount <= 0) return null;
 
   return { date, utr, amount: fmtAmount(amount), mode: "UPI" };
 }
+
 
 export function parseText(text: string): UpiCredit[] {
   const results: UpiCredit[] = [];
