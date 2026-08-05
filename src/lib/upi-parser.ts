@@ -200,14 +200,37 @@ function stitchLines(lines: string[]): string[] {
   return out;
 }
 
+/** Pipe-delimited OCR line: date | narration | ref | debit | credit | balance */
+function parsePipeRow(line: string): UpiCredit | null {
+  const parts = line.split("|").map((p) => p.trim());
+  if (parts.length < 5) return null;
+  const joined = parts.join(" ");
+  if (!UPI_RE.test(joined)) return null;
+
+  const utr = extractUtr(joined);
+  if (!utr) return null;
+  const date = extractDate(parts[0] || "") ?? extractDate(joined);
+  if (!date) return null;
+
+  const debit = moneyTokens(parts[3] || "");
+  const credit = moneyTokens(parts[4] || "");
+  if (debit.length && toNumber(debit[debit.length - 1] ?? "0") > 0) return null;
+  if (!credit.length) return null;
+  const amount = toNumber(credit[credit.length - 1] ?? "0");
+  if (!amount || amount <= 0) return null;
+
+  return { date, utr, amount: fmtAmount(amount), mode: "UPI" };
+}
+
 export function parseText(text: string): UpiCredit[] {
   const results: UpiCredit[] = [];
   for (const line of stitchLines(text.split(/\r?\n/))) {
-    const r = parseTextRow(line);
+    const r = (line.includes("|") ? parsePipeRow(line) : null) ?? parseTextRow(line);
     if (r) results.push(r);
   }
   return dedupe(results);
 }
+
 
 export function parseRows(rows: Row[]): UpiCredit[] {
   const cleaned = rows.map((r) => r.map((c) => (c == null ? "" : String(c).trim())));
