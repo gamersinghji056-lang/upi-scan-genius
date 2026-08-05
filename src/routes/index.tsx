@@ -1,11 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FileUp, Loader2, Download, FileText, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { extractFromFile } from "@/lib/statement-readers";
-import { parseText, toCsv, type UpiCredit } from "@/lib/upi-parser";
+import {
+  mergeResults,
+  parseTextDetailed,
+  toCsv,
+  type ExtractDebug,
+  type UpiCredit,
+} from "@/lib/upi-parser";
+
 
 export const Route = createFileRoute("/")({
   component: Index,
