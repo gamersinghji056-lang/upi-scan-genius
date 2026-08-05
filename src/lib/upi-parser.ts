@@ -299,6 +299,7 @@ function analyze(rowsIn: Row[]): ExtractResult {
   const diagnostics: RowDiagnostic[] = [];
   const results: UpiCredit[] = [];
   let cols: ColumnMap | null = null;
+  let headerLen = 0;
   let prevBalance: number | null = null;
 
   let transactionRows = 0;
@@ -318,6 +319,7 @@ function analyze(rowsIn: Row[]): ExtractResult {
     const maybeHeader = detectColumns(cells);
     if (maybeHeader && !UPI_RE.test(text) && extractDate(text) === null) {
       cols = maybeHeader;
+      headerLen = cells.length;
       push({
         hasDate: false,
         isUpi: false,
@@ -330,8 +332,13 @@ function analyze(rowsIn: Row[]): ExtractResult {
       return;
     }
 
-    const dateCell = cols?.date !== undefined ? cells[cols.date] || "" : "";
+    // Column indices only apply when this row really has the header's shape;
+    // text/OCR rows often collapse empty cells, so fall back to content rules.
+    const rowCols = cols && cells.length === headerLen ? cols : null;
+
+    const dateCell = rowCols?.date !== undefined ? cells[rowCols.date] || "" : "";
     const date = extractDate(dateCell) ?? extractDate(cells[0] || "") ?? extractDate(text);
+
     const refs = extractUtrCandidates(text);
     const isUpi = UPI_RE.test(text);
 
