@@ -141,7 +141,7 @@ function parseTabularRow(cells: Row, cols: ColumnMap): UpiCredit | null {
 
   if (cols.credit !== undefined) {
     const v = moneyTokens(cells[cols.credit] || "");
-    if (v.length) amount = toNumber(v[v.length - 1]);
+    if (v.length) amount = toNumber(v[v.length - 1] ?? "0");
     if (amount === null || amount === 0) return null;
   } else {
     const typeVal = cols.type !== undefined ? (cells[cols.type] || "") : "";
@@ -151,12 +151,12 @@ function parseTabularRow(cells: Row, cols: ColumnMap): UpiCredit | null {
     if (!isCredit) return null;
     if (cols.debit !== undefined) {
       const d = moneyTokens(cells[cols.debit] || "");
-      if (d.length && toNumber(d[d.length - 1]) > 0) return null;
+      if (d.length && toNumber(d[d.length - 1] ?? "0") > 0) return null;
     }
     const src = cols.amount !== undefined ? cells[cols.amount] || "" : line;
     const v = moneyTokens(src);
     if (!v.length) return null;
-    amount = toNumber(cols.amount !== undefined ? v[v.length - 1] : v[v.length - 2] ?? v[0]);
+    amount = toNumber((cols.amount !== undefined ? v[v.length - 1] : (v[v.length - 2] ?? v[0])) ?? "0");
   }
 
   if (!amount || amount <= 0) return null;
@@ -181,7 +181,7 @@ function parseTextRow(line: string): UpiCredit | null {
   if (!tokens.length) return null;
   // Last money token on a statement line is typically the running balance.
   const amountToken = tokens.length >= 2 ? tokens[tokens.length - 2] : tokens[0];
-  const amount = toNumber(amountToken);
+  const amount = toNumber(amountToken ?? "0");
   if (!amount || amount <= 0) return null;
 
   return { date, utr, amount: fmtAmount(amount), mode: "UPI" };
