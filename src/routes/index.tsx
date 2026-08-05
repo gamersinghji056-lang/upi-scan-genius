@@ -229,7 +229,65 @@ function Index() {
             )}
           </section>
         ) : null}
+
+        {devMode && debug ? (
+          <section className="rounded-xl border bg-card p-5 shadow-card">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-sm font-semibold">Debug mode (developer only)</h2>
+              <Button variant="ghost" size="sm" onClick={() => setShowDebug((v) => !v)}>
+                {showDebug ? "Hide rows" : "Show rows"}
+              </Button>
+            </div>
+            <dl className="mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-3">
+              {[
+                ["Input lines", debug.inputLines],
+                ["Transaction rows", debug.transactionRows],
+                ["UPI rows", debug.upiRows],
+                ["Rows with 12-digit ref", debug.rowsWithReference],
+                ["Credit rows", debug.creditRows],
+                ["Accepted", debug.accepted],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="rounded-lg bg-muted/60 px-3 py-2">
+                  <dt className="text-muted-foreground">{label}</dt>
+                  <dd className="font-mono text-sm font-semibold">{value}</dd>
+                </div>
+              ))}
+            </dl>
+            <p className="mt-3 font-mono text-xs text-muted-foreground">
+              Columns: {debug.columns ? JSON.stringify(debug.columns) : "none detected"}
+            </p>
+            {showDebug ? (
+              <div className="mt-3 max-h-96 overflow-auto rounded-lg border">
+                <table className="w-full text-left font-mono text-[11px]">
+                  <thead className="bg-muted/60">
+                    <tr>
+                      <th className="px-2 py-2">#</th>
+                      <th className="px-2 py-2">Row</th>
+                      <th className="px-2 py-2">Dir</th>
+                      <th className="px-2 py-2">Amt</th>
+                      <th className="px-2 py-2">Refs</th>
+                      <th className="px-2 py-2">Result</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {debug.rows.map((d) => (
+                      <tr key={d.index} className="border-t align-top">
+                        <td className="px-2 py-1">{d.index}</td>
+                        <td className="px-2 py-1 max-w-[22rem] truncate">{d.preview}</td>
+                        <td className="px-2 py-1">{d.direction}</td>
+                        <td className="px-2 py-1">{d.amount ?? "—"}</td>
+                        <td className="px-2 py-1">{d.references}</td>
+                        <td className="px-2 py-1">{d.accepted ? "accepted" : (d.reason ?? "rejected")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
       </div>
+
     </main>
   );
 }
