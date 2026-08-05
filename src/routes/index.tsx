@@ -38,13 +38,22 @@ export const Route = createFileRoute("/")({
 
 function Index() {
   const [rows, setRows] = useState<UpiCredit[] | null>(null);
+  const [debug, setDebug] = useState<ExtractDebug | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sourceName, setSourceName] = useState<string | null>(null);
   const [pasted, setPasted] = useState("");
   const [dragging, setDragging] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
+  const [devMode, setDevMode] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Developer mode only: dev server, or ?debug=1 on the URL.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("debug");
+    setDevMode(import.meta.env.DEV || q === "1" || q === "true");
+  }, []);
 
   const runFiles = useCallback(async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -52,13 +61,16 @@ function Index() {
     setBusy(true);
     setError(null);
     try {
-      const all: UpiCredit[] = [];
-      for (const f of list) all.push(...(await extractFromFile(f, setStage)));
-      setRows(all);
+      const parts = [];
+      for (const f of list) parts.push(await extractFromFile(f, setStage));
+      const merged = mergeResults(parts);
+      setRows(merged.rows);
+      setDebug(merged.debug);
       setSourceName(list.map((f) => f.name).join(", "));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not read that file.");
       setRows(null);
+      setDebug(null);
     } finally {
       setBusy(false);
       setStage(null);
@@ -68,8 +80,11 @@ function Index() {
   const runText = () => {
     setError(null);
     setSourceName("Pasted statement text");
-    setRows(parseText(pasted));
+    const result = parseTextDetailed(pasted);
+    setRows(result.rows);
+    setDebug(result.debug);
   };
+
 
   const download = () => {
     if (!rows) return;
