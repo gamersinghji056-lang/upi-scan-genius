@@ -203,6 +203,10 @@ function fmtAmount(n: number) {
 type RowValue = { index: number; value: number };
 
 function rowValues(cells: Row, cols: ColumnMap | null): RowValue[] {
+  // Unsegmented row (plain text line): treat each money token as its own slot.
+  if (cells.length === 1) {
+    return moneyTokens(cells[0] || "").map((t, i) => ({ index: i, value: toNumber(t) }));
+  }
   const out: RowValue[] = [];
   cells.forEach((cell, i) => {
     if (cols?.date === i || cols?.narration === i) return;
@@ -211,6 +215,7 @@ function rowValues(cells: Row, cols: ColumnMap | null): RowValue[] {
   });
   return out;
 }
+
 
 type Classified = {
   direction: "credit" | "debit" | "unknown";
