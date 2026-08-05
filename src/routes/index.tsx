@@ -1,11 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FileUp, Loader2, Download, FileText, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { extractFromFile } from "@/lib/statement-readers";
-import { parseText, toCsv, type UpiCredit } from "@/lib/upi-parser";
+import {
+  mergeResults,
+  parseTextDetailed,
+  toCsv,
+  type ExtractDebug,
+  type UpiCredit,
+} from "@/lib/upi-parser";
+
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -31,13 +38,22 @@ export const Route = createFileRoute("/")({
 
 function Index() {
   const [rows, setRows] = useState<UpiCredit[] | null>(null);
+  const [debug, setDebug] = useState<ExtractDebug | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sourceName, setSourceName] = useState<string | null>(null);
   const [pasted, setPasted] = useState("");
   const [dragging, setDragging] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
+  const [devMode, setDevMode] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Developer mode only: dev server, or ?debug=1 on the URL.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("debug");
+    setDevMode(import.meta.env.DEV || q === "1" || q === "true");
+  }, []);
 
   const runFiles = useCallback(async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -45,13 +61,16 @@ function Index() {
     setBusy(true);
     setError(null);
     try {
-      const all: UpiCredit[] = [];
-      for (const f of list) all.push(...(await extractFromFile(f, setStage)));
-      setRows(all);
+      const parts = [];
+      for (const f of list) parts.push(await extractFromFile(f, setStage));
+      const merged = mergeResults(parts);
+      setRows(merged.rows);
+      setDebug(merged.debug);
       setSourceName(list.map((f) => f.name).join(", "));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not read that file.");
       setRows(null);
+      setDebug(null);
     } finally {
       setBusy(false);
       setStage(null);
@@ -61,8 +80,11 @@ function Index() {
   const runText = () => {
     setError(null);
     setSourceName("Pasted statement text");
-    setRows(parseText(pasted));
+    const result = parseTextDetailed(pasted);
+    setRows(result.rows);
+    setDebug(result.debug);
   };
+
 
   const download = () => {
     if (!rows) return;
@@ -207,7 +229,65 @@ function Index() {
             )}
           </section>
         ) : null}
+
+        {devMode && debug ? (
+          <section className="rounded-xl border bg-card p-5 shadow-card">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-sm font-semibold">Debug mode (developer only)</h2>
+              <Button variant="ghost" size="sm" onClick={() => setShowDebug((v) => !v)}>
+                {showDebug ? "Hide rows" : "Show rows"}
+              </Button>
+            </div>
+            <dl className="mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-3">
+              {[
+                ["Input lines", debug.inputLines],
+                ["Transaction rows", debug.transactionRows],
+                ["UPI rows", debug.upiRows],
+                ["Rows with 12-digit ref", debug.rowsWithReference],
+                ["Credit rows", debug.creditRows],
+                ["Accepted", debug.accepted],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="rounded-lg bg-muted/60 px-3 py-2">
+                  <dt className="text-muted-foreground">{label}</dt>
+                  <dd className="font-mono text-sm font-semibold">{value}</dd>
+                </div>
+              ))}
+            </dl>
+            <p className="mt-3 font-mono text-xs text-muted-foreground">
+              Columns: {debug.columns ? JSON.stringify(debug.columns) : "none detected"}
+            </p>
+            {showDebug ? (
+              <div className="mt-3 max-h-96 overflow-auto rounded-lg border">
+                <table className="w-full text-left font-mono text-[11px]">
+                  <thead className="bg-muted/60">
+                    <tr>
+                      <th className="px-2 py-2">#</th>
+                      <th className="px-2 py-2">Row</th>
+                      <th className="px-2 py-2">Dir</th>
+                      <th className="px-2 py-2">Amt</th>
+                      <th className="px-2 py-2">Refs</th>
+                      <th className="px-2 py-2">Result</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {debug.rows.map((d) => (
+                      <tr key={d.index} className="border-t align-top">
+                        <td className="px-2 py-1">{d.index}</td>
+                        <td className="px-2 py-1 max-w-[22rem] truncate">{d.preview}</td>
+                        <td className="px-2 py-1">{d.direction}</td>
+                        <td className="px-2 py-1">{d.amount ?? "—"}</td>
+                        <td className="px-2 py-1">{d.references}</td>
+                        <td className="px-2 py-1">{d.accepted ? "accepted" : (d.reason ?? "rejected")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
       </div>
+
     </main>
   );
 }

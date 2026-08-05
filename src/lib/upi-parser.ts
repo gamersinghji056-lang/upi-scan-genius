@@ -7,9 +7,21 @@ export type UpiCredit = {
 
 export type Row = string[];
 
-const UPI_RE = /\bupi\b|upi[\/\-:]/i;
-const EXCLUDE_RE =
-  /\b(neft|rtgs|imps|cheque|chq|cash\s*dep|cash\s*with|atm|pos\b|debit\s*card|credit\s*card|interest|charges?|reversal|opening\s*balance|closing\s*balance|available\s*balance)\b/i;
+/* ------------------------------------------------------------------ *
+ * Vocabulary — intent based, never bank/template specific.
+ * ------------------------------------------------------------------ */
+
+const UPI_RE = /\bupi\b|upi[\s/\-:_]/i;
+
+const CREDIT_WORDS =
+  /\b(cr|crd|credit|credits|credited|credit\s*amount|credit\s*value|deposit|deposits|received|receipt|incoming|inward|in\b)\b/i;
+const DEBIT_WORDS =
+  /\b(dr|debit|debits|debited|debit\s*amount|debit\s*value|withdraw|withdrawal|withdrawals|withdrawn|sent|paid|payment\s*out|outgoing|outward|out\b)\b/i;
+const BALANCE_WORDS = /\b(balance|bal|closing|running)\b/i;
+const DATE_WORDS = /\b(date|dt)\b|date/i;
+const AMOUNT_WORDS = /\b(amount|amt|value|transaction\s*amount)\b/i;
+const TYPE_WORDS = /(type|cr\s*[/|]\s*dr|dr\s*[/|]\s*cr|indicator|dr\s*\/\s*cr)/i;
+const NARRATION_WORDS = /(narration|description|particular|remark|details|transaction\s*detail)/i;
 
 const MONTHS: Record<string, string> = {
   jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
@@ -20,7 +32,7 @@ const DATE_PATTERNS: RegExp[] = [
   /\b(\d{2})[-/.](\d{2})[-/.](\d{4})\b/,
   /\b(\d{4})[-/.](\d{2})[-/.](\d{2})\b/,
   /\b(\d{1,2})[-/\s]([A-Za-z]{3,9})[-/\s](\d{2,4})\b/,
-  /\b(\d{2})[-/.](\d{2})[-/.](\d{2})\b/,
+  /\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})\b/,
 ];
 
 function pad(n: string) {
@@ -48,44 +60,57 @@ export function extractDate(text: string): string | null {
   }
 
   m = dmy2.exec(text);
-  if (m) return `${m[1]}/${m[2]}/20${m[3]}`;
+  if (m) return `${pad(m[1] ?? "")}/${pad(m[2] ?? "")}/20${m[3]}`;
 
   return null;
 }
 
-
-/** First standalone 12-digit numeric reference in the row. */
-export function extractUtr(text: string): string | null {
-  const matches = text.match(/(?<!\d)\d{12}(?!\d)/g);
-  if (!matches) return null;
-  // Prefer a 12-digit number appearing after the UPI keyword in the narration.
-  const upiIdx = text.search(UPI_RE);
-  if (upiIdx >= 0) {
-    const after = text.slice(upiIdx).match(/(?<!\d)\d{12}(?!\d)/);
-    if (after) return after[0];
-  }
-  return matches[0];
+/** Every standalone 12-digit numeric value in the row. */
+export function extractUtrCandidates(text: string): string[] {
+  return text.match(/(?<!\d)\d{12}(?!\d)/g) ?? [];
 }
 
-const MONEY_RE = /(?<![\d.])(\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?|\d+\.\d{1,2})(?!\d)/g;
+/** Best 12-digit reference for a UPI row: prefer one appearing after the UPI keyword. */
+export function extractUtr(text: string): string | null {
+  const all = extractUtrCandidates(text);
+  if (!all.length) return null;
+  const upiIdx = text.search(UPI_RE);
+  if (upiIdx >= 0) {
+    const after = extractUtrCandidates(text.slice(upiIdx));
+    if (after.length) return after[0] ?? null;
+  }
+  return all[0] ?? null;
+}
+
+const MONEY_RE = /(?<![\d.])(\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?!\d)/g;
 
 function toNumber(s: string) {
   return Number(s.replace(/,/g, ""));
 }
 
+/** Money-looking tokens in a fragment, with dates and long references removed. */
 function moneyTokens(text: string): string[] {
-  // Strip dates and long reference numbers so they are not read as amounts.
   const cleaned = text
     .replace(/\d{1,4}[-/.]\d{1,2}[-/.]\d{2,4}/g, " ")
-    .replace(/(?<!\d)\d{10,}(?!\d)/g, " ");
+    .replace(/(?<!\d)\d{7,}(?!\d)/g, " ")
+    .replace(/(?<!\d)\d{5,6}(?![\d.,])/g, " "); // bare 5-6 digit refs, but keep 12345.67
   return cleaned.match(MONEY_RE) ?? [];
 }
 
-const CREDIT_RE = /\b(cr|credit|deposit|received|incoming|inward)\b/i;
-const DEBIT_RE = /\b(dr|debit|withdrawal|withdrawn|paid|sent|outgoing)\b/i;
+function cellAmount(cell: string): number | null {
+  const t = moneyTokens(cell);
+  if (!t.length) return null;
+  const n = toNumber(t[t.length - 1] ?? "");
+  return Number.isFinite(n) ? n : null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Column classification (intelligent, position independent)
+ * ------------------------------------------------------------------ */
 
 export type ColumnMap = {
   date?: number;
+  narration?: number;
   credit?: number;
   debit?: number;
   amount?: number;
@@ -93,190 +118,381 @@ export type ColumnMap = {
   balance?: number;
 };
 
+/** Classify a candidate header row. Returns null when it is not a header. */
 export function detectColumns(header: Row): ColumnMap | null {
   const map: ColumnMap = {};
   let hits = 0;
   header.forEach((raw, i) => {
-    const h = (raw || "").toLowerCase().trim();
-    if (!h) return;
-    if (map.date === undefined && /(txn|transaction|value|tran|book)?\s*date/.test(h)) {
-      if (/value/.test(h) && map.date !== undefined) return;
-      map.date = i;
+    const h = (raw || "").toLowerCase().replace(/\s+/g, " ").trim();
+    if (!h || h.length > 40) return;
+    if (BALANCE_WORDS.test(h)) {
+      if (map.balance === undefined) map.balance = i;
+      return;
+    }
+    if (DATE_WORDS.test(h) && !/update/.test(h)) {
+      if (map.date === undefined) {
+        map.date = i;
+        hits++;
+      }
+      return;
+    }
+    if (NARRATION_WORDS.test(h)) {
+      if (map.narration === undefined) map.narration = i;
       hits++;
-    } else if (/credit|deposit|cr\s*amount|\bcr\b/.test(h) && !/debit/.test(h)) {
-      map.credit = i;
+      return;
+    }
+    if (TYPE_WORDS.test(h)) {
+      if (map.type === undefined) map.type = i;
       hits++;
-    } else if (/debit|withdraw|dr\s*amount|\bdr\b/.test(h)) {
-      map.debit = i;
+      return;
+    }
+    if (CREDIT_WORDS.test(h) && !DEBIT_WORDS.test(h)) {
+      if (map.credit === undefined) map.credit = i;
       hits++;
-    } else if (/balance/.test(h)) {
-      map.balance = i;
-    } else if (/amount|amt/.test(h)) {
-      map.amount = i;
+      return;
+    }
+    if (DEBIT_WORDS.test(h) && !CREDIT_WORDS.test(h)) {
+      if (map.debit === undefined) map.debit = i;
       hits++;
-    } else if (/type|cr\s*\/\s*dr|dr\s*\/\s*cr|indicator/.test(h)) {
-      map.type = i;
+      return;
+    }
+    if (AMOUNT_WORDS.test(h)) {
+      if (map.amount === undefined) map.amount = i;
       hits++;
     }
   });
   return hits >= 2 ? map : null;
 }
 
+/* ------------------------------------------------------------------ *
+ * Row engine
+ * ------------------------------------------------------------------ */
+
+export type RowDiagnostic = {
+  index: number;
+  preview: string;
+  hasDate: boolean;
+  isUpi: boolean;
+  references: number;
+  direction: "credit" | "debit" | "unknown";
+  amount: string | null;
+  accepted: boolean;
+  reason?: string;
+};
+
+export type ExtractDebug = {
+  inputLines: number;
+  transactionRows: number;
+  upiRows: number;
+  rowsWithReference: number;
+  creditRows: number;
+  accepted: number;
+  columns: ColumnMap | null;
+  rows: RowDiagnostic[];
+};
+
+export type ExtractResult = {
+  rows: UpiCredit[];
+  debug: ExtractDebug;
+};
+
 function fmtAmount(n: number) {
   return n.toFixed(2);
 }
 
-function parseTabularRow(cells: Row, cols: ColumnMap): UpiCredit | null {
-  const line = cells.join(" ");
-  if (!UPI_RE.test(line)) return null;
+type RowValue = { index: number; value: number };
 
-  const utr = extractUtr(line);
-  if (!utr) return null;
+function rowValues(cells: Row, cols: ColumnMap | null): RowValue[] {
+  // Unsegmented row (plain text line): treat each money token as its own slot.
+  if (cells.length === 1) {
+    return moneyTokens(cells[0] || "").map((t, i) => ({ index: i, value: toNumber(t) }));
+  }
+  const out: RowValue[] = [];
+  cells.forEach((cell, i) => {
+    if (cols?.date === i || cols?.narration === i) return;
+    const v = cellAmount(cell || "");
+    if (v !== null) out.push({ index: i, value: v });
+  });
+  return out;
+}
 
-  const dateCell = cols.date !== undefined ? cells[cols.date] : "";
-  const date = extractDate(dateCell || "") ?? extractDate(line);
-  if (!date) return null;
 
-  let amount: number | null = null;
+type Classified = {
+  direction: "credit" | "debit" | "unknown";
+  amount: number | null;
+  balance: number | null;
+  note?: string;
+};
 
-  if (cols.credit !== undefined) {
-    const v = moneyTokens(cells[cols.credit] || "");
-    if (v.length) amount = toNumber(v[v.length - 1] ?? "0");
-    if (amount === null || amount === 0) return null;
-  } else {
-    const typeVal = cols.type !== undefined ? (cells[cols.type] || "") : "";
-    const isCredit = typeVal
-      ? CREDIT_RE.test(typeVal) && !DEBIT_RE.test(typeVal)
-      : CREDIT_RE.test(line) && !DEBIT_RE.test(line);
-    if (!isCredit) return null;
-    if (cols.debit !== undefined) {
-      const d = moneyTokens(cells[cols.debit] || "");
-      if (d.length && toNumber(d[d.length - 1] ?? "0") > 0) return null;
+/** Decide credit/debit and the transaction amount for a single row, in isolation. */
+function classifyRow(
+  cells: Row,
+  text: string,
+  cols: ColumnMap | null,
+  prevBalance: number | null,
+): Classified {
+  const values = rowValues(cells, cols);
+
+  // Balance: explicit column, otherwise the last numeric on the row.
+  let balance: number | null = null;
+  let balanceIdx: number | null = null;
+  if (cols?.balance !== undefined) {
+    const v = cellAmount(cells[cols.balance] || "");
+    if (v !== null) {
+      balance = v;
+      balanceIdx = cols.balance;
     }
-    const src = cols.amount !== undefined ? cells[cols.amount] || "" : line;
-    const v = moneyTokens(src);
-    if (!v.length) return null;
-    amount = toNumber((cols.amount !== undefined ? v[v.length - 1] : (v[v.length - 2] ?? v[0])) ?? "0");
+  } else if (values.length >= 2) {
+    const last = values[values.length - 1] as RowValue;
+    balance = last.value;
+    balanceIdx = last.index;
   }
 
-  if (!amount || amount <= 0) return null;
-  return { date, utr, amount: fmtAmount(amount), mode: "UPI" };
+  const nonBalance = values.filter((v) => v.index !== balanceIdx && v.value > 0);
+
+  // 1. Explicit credit / debit columns.
+  if (cols?.credit !== undefined || cols?.debit !== undefined) {
+    const credit = cols?.credit !== undefined ? cellAmount(cells[cols.credit] || "") : null;
+    const debit = cols?.debit !== undefined ? cellAmount(cells[cols.debit] || "") : null;
+    if (debit && debit > 0) return { direction: "debit", amount: debit, balance };
+    if (credit && credit > 0) return { direction: "credit", amount: credit, balance };
+  }
+
+  // 2. Explicit type / indicator column or a standalone Cr/Dr token in the row.
+  const typeCell = cols?.type !== undefined ? cells[cols.type] || "" : "";
+  const indicator = typeCell || cells.find((c) => /^\s*(cr|dr|c|d)\.?\s*$/i.test(c || "")) || "";
+  let direction: "credit" | "debit" | "unknown" = "unknown";
+  if (indicator) {
+    if (CREDIT_WORDS.test(indicator) && !DEBIT_WORDS.test(indicator)) direction = "credit";
+    else if (DEBIT_WORDS.test(indicator)) direction = "debit";
+  }
+
+  // 3. Balance chain — the most reliable bank-independent signal.
+  let chainAmount: number | null = null;
+  if (balance !== null && prevBalance !== null) {
+    const delta = Number((balance - prevBalance).toFixed(2));
+    const match = nonBalance.find((v) => Math.abs(v.value - Math.abs(delta)) < 0.02);
+    if (match && Math.abs(delta) > 0) {
+      chainAmount = match.value;
+      direction = delta > 0 ? "credit" : "debit";
+    }
+  }
+
+  // 4. Fall back to Cr/Dr words anywhere in this row (this row only).
+  if (direction === "unknown") {
+    const c = CREDIT_WORDS.test(text);
+    const d = DEBIT_WORDS.test(text);
+    if (c && !d) direction = "credit";
+    else if (d && !c) direction = "debit";
+  }
+
+  // Amount selection.
+  let amount: number | null = chainAmount;
+  if (amount === null && cols?.amount !== undefined) amount = cellAmount(cells[cols.amount] || "");
+  if (amount === null) {
+    if (nonBalance.length === 1) amount = (nonBalance[0] as RowValue).value;
+    else if (nonBalance.length > 1) {
+      // Positional slots (OCR/pipe rows): debit slot then credit slot.
+      amount = (nonBalance[nonBalance.length - 1] as RowValue).value;
+    }
+  }
+
+  return { direction, amount, balance };
 }
 
-function parseTextRow(line: string): UpiCredit | null {
-  if (!UPI_RE.test(line)) return null;
-  if (EXCLUDE_RE.test(line) && !/upi/i.test(line.replace(EXCLUDE_RE, ""))) return null;
+function analyze(rowsIn: Row[]): ExtractResult {
+  const diagnostics: RowDiagnostic[] = [];
+  const results: UpiCredit[] = [];
+  let cols: ColumnMap | null = null;
+  let headerLen = 0;
+  let prevBalance: number | null = null;
 
-  const hasCredit = CREDIT_RE.test(line);
-  const hasDebit = DEBIT_RE.test(line);
-  if (!hasCredit || hasDebit) return null;
+  let transactionRows = 0;
+  let upiRows = 0;
+  let rowsWithReference = 0;
+  let creditRows = 0;
 
-  const utr = extractUtr(line);
-  if (!utr) return null;
+  rowsIn.forEach((raw, i) => {
+    const cells = raw.map((c) => (c == null ? "" : String(c).replace(/\s+/g, " ").trim()));
+    const text = cells.join(" ").trim();
+    if (!text) return;
 
-  const date = extractDate(line);
-  if (!date) return null;
+    const push = (d: Omit<RowDiagnostic, "index" | "preview">) =>
+      diagnostics.push({ index: i, preview: text.slice(0, 160), ...d });
 
-  const tokens = moneyTokens(line);
-  if (!tokens.length) return null;
-  // Last money token on a statement line is typically the running balance.
-  const amountToken = tokens.length >= 2 ? tokens[tokens.length - 2] : tokens[0];
-  const amount = toNumber(amountToken ?? "0");
-  if (!amount || amount <= 0) return null;
+    // Opening / brought-forward balance seeds the running-balance chain.
+    if (/\b(opening\s*balance|balance\s*b\/?f|brought\s*forward|b\/f)\b/i.test(text)) {
+      const t = moneyTokens(text);
+      if (t.length) {
+        prevBalance = toNumber(t[t.length - 1] ?? "");
+        push({
+          hasDate: false,
+          isUpi: false,
+          references: 0,
+          direction: "unknown",
+          amount: null,
+          accepted: false,
+          reason: "Opening balance — chain seeded",
+        });
+        return;
+      }
+    }
 
-  return { date, utr, amount: fmtAmount(amount), mode: "UPI" };
+
+    // Header rows re-train the column map; they are never transactions.
+    const maybeHeader = detectColumns(cells);
+    if (maybeHeader && !UPI_RE.test(text) && extractDate(text) === null) {
+      cols = maybeHeader;
+      headerLen = cells.length;
+      push({
+        hasDate: false,
+        isUpi: false,
+        references: 0,
+        direction: "unknown",
+        amount: null,
+        accepted: false,
+        reason: "Header row — column map learned",
+      });
+      return;
+    }
+
+    // Column indices only apply when this row really has the header's shape;
+    // text/OCR rows often collapse empty cells, so fall back to content rules.
+    const rowCols = cols && cells.length === headerLen ? cols : null;
+
+    const dateCell = rowCols?.date !== undefined ? cells[rowCols.date] || "" : "";
+    const date = extractDate(dateCell) ?? extractDate(cells[0] || "") ?? extractDate(text);
+
+    const refs = extractUtrCandidates(text);
+    const isUpi = UPI_RE.test(text);
+
+    if (!date) {
+      push({
+        hasDate: false,
+        isUpi,
+        references: refs.length,
+        direction: "unknown",
+        amount: null,
+        accepted: false,
+        reason: "No date — not a transaction row (header, footer or summary)",
+      });
+      return;
+    }
+
+    transactionRows++;
+    const cls = classifyRow(cells, text, rowCols, prevBalance);
+    if (cls.balance !== null) prevBalance = cls.balance;
+    if (isUpi) upiRows++;
+    if (refs.length) rowsWithReference++;
+    if (cls.direction === "credit") creditRows++;
+
+    const base = {
+      hasDate: true,
+      isUpi,
+      references: refs.length,
+      direction: cls.direction,
+      amount: cls.amount === null ? null : fmtAmount(cls.amount),
+    };
+
+    if (!isUpi) {
+      push({ ...base, accepted: false, reason: "No UPI keyword in narration" });
+      return;
+    }
+    const utr = extractUtr(text);
+    if (!utr) {
+      push({ ...base, accepted: false, reason: "No 12-digit UPI reference on this row" });
+      return;
+    }
+    if (cls.direction === "debit") {
+      push({ ...base, accepted: false, reason: "Row classified as Debit" });
+      return;
+    }
+    if (cls.direction === "unknown") {
+      push({ ...base, accepted: false, reason: "Could not classify row as Credit or Debit" });
+      return;
+    }
+    if (!cls.amount || cls.amount <= 0) {
+      push({ ...base, accepted: false, reason: "No credit amount found (balance excluded)" });
+      return;
+    }
+
+    results.push({ date, utr, amount: fmtAmount(cls.amount), mode: "UPI" });
+    push({ ...base, accepted: true });
+  });
+
+  const rows = dedupe(results);
+  return {
+    rows,
+    debug: {
+      inputLines: rowsIn.length,
+      transactionRows,
+      upiRows,
+      rowsWithReference,
+      creditRows,
+      accepted: rows.length,
+      columns: cols,
+      rows: diagnostics,
+    },
+  };
 }
 
-/** Merge wrapped continuation lines into the line that started a transaction. */
+/* ------------------------------------------------------------------ *
+ * Text → rows
+ * ------------------------------------------------------------------ */
+
+/** Merge wrapped continuation lines into the row that started a transaction. */
 function stitchLines(lines: string[]): string[] {
   const out: string[] = [];
   for (const raw of lines) {
-    const line = raw.replace(/\s+/g, " ").trim();
-    if (!line) continue;
+    const line = raw.replace(/\u00a0/g, " ").trimEnd();
+    if (!line.trim()) continue;
     const startsTxn = extractDate(line) !== null;
     if (startsTxn || out.length === 0) out.push(line);
-    else out[out.length - 1] += " " + line;
+    else out[out.length - 1] += " " + line.trim();
   }
   return out;
 }
 
-/**
- * Pipe-delimited line (OCR transcription):
- * date | narration | [ref] | debit | credit | balance — with empty slots kept.
- * Slots are identified by content, not by fixed index.
- */
-function parsePipeRow(line: string): UpiCredit | null {
-  const parts = line.split("|").map((p) => p.trim());
-  if (parts.length < 4) return null;
-  const joined = parts.join(" ");
-  if (!UPI_RE.test(joined)) return null;
-
-  const utr = extractUtr(joined);
-  if (!utr) return null;
-  const date = extractDate(parts[0] || "") ?? extractDate(joined);
-  if (!date) return null;
-
-  const moneyIdx: number[] = [];
-  parts.forEach((p, i) => {
-    if (i === 0) return;
-    if (moneyTokens(p).length && /\d/.test(p) && !UPI_RE.test(p)) moneyIdx.push(i);
-  });
-  if (moneyIdx.length < 2) return null;
-
-  // Last money slot is the running balance.
-  const valueIdx = moneyIdx.slice(0, -1);
-  let creditIdx: number | null = null;
-
-  if (valueIdx.length === 1) {
-    const i = valueIdx[0] as number;
-    const before = (parts[i - 1] ?? "x").length === 0;
-    const after = (parts[i + 1] ?? "x").length === 0;
-    if (before && !after) creditIdx = i;
-    else if (after && !before) creditIdx = null;
-    else if (CREDIT_RE.test(joined) && !DEBIT_RE.test(joined)) creditIdx = i;
-  } else {
-    // Both debit and credit slots carry a value: later slot is the credit column.
-    const last = valueIdx[valueIdx.length - 1] as number;
-    const prev = valueIdx[valueIdx.length - 2] as number;
-    if (toNumber(moneyTokens(parts[prev] ?? "")[0] ?? "0") > 0) return null;
-    creditIdx = last;
-  }
-
-  if (creditIdx === null) return null;
-  const tokens = moneyTokens(parts[creditIdx] ?? "");
-  const amount = toNumber(tokens[tokens.length - 1] ?? "0");
-  if (!amount || amount <= 0) return null;
-
-  return { date, utr, amount: fmtAmount(amount), mode: "UPI" };
+/** Split one statement line into cells without assuming any fixed layout. */
+function lineToCells(line: string): Row {
+  if (line.includes("|")) return line.split("|").map((p) => p.trim());
+  if (line.includes("\t")) return line.split("\t").map((p) => p.trim());
+  const bySpaces = line.split(/\s{2,}/).map((p) => p.trim());
+  if (bySpaces.length >= 3) return bySpaces;
+  return [line.trim()];
 }
 
+export function parseTextDetailed(text: string): ExtractResult {
+  return analyze(stitchLines(text.split(/\r?\n/)).map(lineToCells));
+}
+
+export function parseRowsDetailed(rows: Row[]): ExtractResult {
+  return analyze(rows.map((r) => r.map((c) => (c == null ? "" : String(c)))));
+}
 
 export function parseText(text: string): UpiCredit[] {
-  const results: UpiCredit[] = [];
-  for (const line of stitchLines(text.split(/\r?\n/))) {
-    const r = (line.includes("|") ? parsePipeRow(line) : null) ?? parseTextRow(line);
-    if (r) results.push(r);
-  }
-  return dedupe(results);
+  return parseTextDetailed(text).rows;
 }
 
-
 export function parseRows(rows: Row[]): UpiCredit[] {
-  const cleaned = rows.map((r) => r.map((c) => (c == null ? "" : String(c).trim())));
-  let cols: ColumnMap | null = null;
-  const results: UpiCredit[] = [];
+  return parseRowsDetailed(rows).rows;
+}
 
-  for (const cells of cleaned) {
-    if (!cells.some((c) => c)) continue;
-    const maybe = detectColumns(cells);
-    if (maybe && !UPI_RE.test(cells.join(" "))) {
-      cols = maybe;
-      continue;
-    }
-    const r = cols ? parseTabularRow(cells, cols) : parseTextRow(cells.join(" "));
-    if (r) results.push(r);
-  }
-  return dedupe(results);
+export function mergeResults(list: ExtractResult[]): ExtractResult {
+  const rows = dedupe(list.flatMap((r) => r.rows));
+  return {
+    rows,
+    debug: {
+      inputLines: list.reduce((s, r) => s + r.debug.inputLines, 0),
+      transactionRows: list.reduce((s, r) => s + r.debug.transactionRows, 0),
+      upiRows: list.reduce((s, r) => s + r.debug.upiRows, 0),
+      rowsWithReference: list.reduce((s, r) => s + r.debug.rowsWithReference, 0),
+      creditRows: list.reduce((s, r) => s + r.debug.creditRows, 0),
+      accepted: rows.length,
+      columns: list.find((r) => r.debug.columns)?.debug.columns ?? null,
+      rows: list.flatMap((r) => r.debug.rows),
+    },
+  };
 }
 
 function dedupe(list: UpiCredit[]): UpiCredit[] {
