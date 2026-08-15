@@ -196,39 +196,103 @@ function Index() {
         ) : null}
 
         {rows ? (
+          <section className="rounded-xl border bg-card p-5 shadow-card">
+            <h2 className="text-sm font-semibold">Statement summary</h2>
+            <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+              {[
+                ["Credit volume", money(total)],
+                ["Debit volume", money(debitTotal)],
+                ["Difference", money(diff)],
+                ["Credit transactions", String(rows.length)],
+                ["Debit transactions", String(debits?.length ?? 0)],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded-lg bg-surface-ledger px-3 py-2">
+                  <dt className="text-xs text-muted-foreground">{label}</dt>
+                  <dd className="font-mono text-sm font-semibold">{value}</dd>
+                </div>
+              ))}
+            </dl>
+            <p className="mt-3 text-sm">
+              {debitTotal > total
+                ? `Debit more than Credit by ${money(diff)}`
+                : total > debitTotal
+                  ? `Credit more than Debit by ${money(diff)}`
+                  : "Credit and Debit are equal"}
+            </p>
+            {debits?.length ? (
+              <ul className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
+                {breakdown.map((b) => (
+                  <li key={b.mode} className="flex justify-between rounded-lg bg-muted/60 px-3 py-2">
+                    <span>{b.mode} debit</span>
+                    <span className="font-mono">
+                      {money(b.volume)} — {b.count} txn{b.count === 1 ? "" : "s"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <div className="mt-4 flex gap-2">
+              <Button
+                variant={tab === "credit" ? "default" : "secondary"}
+                size="sm"
+                onClick={() => setTab("credit")}
+              >
+                See Credit
+              </Button>
+              <Button
+                variant={tab === "debit" ? "default" : "secondary"}
+                size="sm"
+                onClick={() => setTab("debit")}
+              >
+                See Debit
+              </Button>
+            </div>
+          </section>
+        ) : null}
+
+        {rows ? (
           <section className="overflow-hidden rounded-xl border bg-card shadow-card">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b bg-surface-ledger px-5 py-4">
               <div className="min-w-0">
                 <h2 className="flex items-center gap-2 text-sm font-semibold">
                   <FileText className="h-4 w-4 text-primary" aria-hidden />
-                  {rows.length} UPI credit{rows.length === 1 ? "" : "s"}
+                  {tab === "credit"
+                    ? `${rows.length} UPI credit${rows.length === 1 ? "" : "s"}`
+                    : `${debits?.length ?? 0} debit${(debits?.length ?? 0) === 1 ? "" : "s"}`}
                 </h2>
                 <p className="truncate text-xs text-muted-foreground">{sourceName}</p>
               </div>
               <div className="flex items-center gap-4">
                 <span className="font-mono text-sm font-semibold">
-                  ₹{total.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                  {money(tab === "credit" ? total : debitTotal)}
                 </span>
-                <Button variant="secondary" size="sm" onClick={download} disabled={!rows.length}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={download}
+                  disabled={tab === "credit" ? !rows.length : !debits?.length}
+                >
                   <Download className="mr-1 h-4 w-4" />
                   CSV
                 </Button>
               </div>
             </div>
 
-            {rows.length ? (
+            {(tab === "credit" ? rows.length : (debits?.length ?? 0)) ? (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left text-xs tracking-wide text-muted-foreground uppercase">
                       <th className="px-5 py-3 font-medium">Date</th>
-                      <th className="px-5 py-3 font-medium">UTR</th>
+                      <th className="px-5 py-3 font-medium">
+                        {tab === "credit" ? "UTR" : "UTR / Reference"}
+                      </th>
                       <th className="px-5 py-3 text-right font-medium">Amount</th>
                       <th className="px-5 py-3 font-medium">Mode</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.map((r, i) => (
+                    {(tab === "credit" ? rows : (debits ?? [])).map((r, i) => (
                       <tr key={`${r.utr}-${i}`} className="border-b last:border-0 hover:bg-muted/60">
                         <td className="px-5 py-3 font-mono whitespace-nowrap">{r.date}</td>
                         <td className="px-5 py-3 font-mono">{r.utr}</td>
@@ -241,8 +305,9 @@ function Index() {
               </div>
             ) : (
               <p className="px-5 py-10 text-center text-sm text-muted-foreground">
-                No rows matched all four conditions (date, UPI keyword, 12-digit UTR, credit
-                amount).
+                {tab === "credit"
+                  ? "No rows matched all four conditions (date, UPI keyword, 12-digit UTR, credit amount)."
+                  : "No UPI, IMPS, NEFT or RTGS debit rows matched all required fields."}
               </p>
             )}
           </section>
