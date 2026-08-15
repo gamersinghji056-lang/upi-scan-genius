@@ -4,7 +4,14 @@ import { FileUp, Loader2, Download, FileText, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { extractFromFile } from "@/lib/statement-readers";
+import { extractFromFile, mergeCombined } from "@/lib/statement-readers";
+import {
+  debitBreakdown,
+  parseDebitsFromText,
+  timestampName,
+  toDebitCsv,
+  type DebitTxn,
+} from "@/lib/debit-parser";
 import {
   mergeResults,
   parseTextDetailed,
@@ -38,6 +45,8 @@ export const Route = createFileRoute("/")({
 
 function Index() {
   const [rows, setRows] = useState<UpiCredit[] | null>(null);
+  const [debits, setDebits] = useState<DebitTxn[] | null>(null);
+  const [tab, setTab] = useState<"credit" | "debit">("credit");
   const [debug, setDebug] = useState<ExtractDebug | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,13 +72,15 @@ function Index() {
     try {
       const parts = [];
       for (const f of list) parts.push(await extractFromFile(f, setStage));
-      const merged = mergeResults(parts);
-      setRows(merged.rows);
-      setDebug(merged.debug);
+      const merged = mergeCombined(parts);
+      setRows(merged.credit.rows);
+      setDebits(merged.debit.rows);
+      setDebug(merged.credit.debug);
       setSourceName(list.map((f) => f.name).join(", "));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not read that file.");
       setRows(null);
+      setDebits(null);
       setDebug(null);
     } finally {
       setBusy(false);
@@ -83,21 +94,29 @@ function Index() {
     const result = parseTextDetailed(pasted);
     setRows(result.rows);
     setDebug(result.debug);
+    setDebits(parseDebitsFromText(pasted).rows);
   };
 
 
   const download = () => {
-    if (!rows) return;
-    const blob = new Blob([toCsv(rows)], { type: "text/csv;charset=utf-8" });
+    const isCredit = tab === "credit";
+    const data = isCredit ? rows : debits;
+    if (!data) return;
+    const csv = isCredit ? toCsv(data as UpiCredit[]) : toDebitCsv(data as DebitTxn[]);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "upi-credits.csv";
+    a.download = timestampName(isCredit ? "UPI_Credit_Report" : "Debit_Report");
     a.click();
     URL.revokeObjectURL(url);
   };
 
   const total = rows?.reduce((s, r) => s + Number(r.amount), 0) ?? 0;
+  const debitTotal = debits?.reduce((s, r) => s + Number(r.amount), 0) ?? 0;
+  const diff = Math.abs(total - debitTotal);
+  const money = (n: number) => `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const breakdown = debits ? debitBreakdown(debits) : [];
 
   return (
     <main className="min-h-screen">
