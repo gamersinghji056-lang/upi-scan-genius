@@ -13,7 +13,6 @@ import {
   type DebitTxn,
 } from "@/lib/debit-parser";
 import {
-  mergeResults,
   parseTextDetailed,
   toCsv,
   type ExtractDebug,
