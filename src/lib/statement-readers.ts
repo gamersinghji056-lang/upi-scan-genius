@@ -1,6 +1,29 @@
 import { ocrStatementPages } from "./ocr.functions";
 import type { ExtractResult, Row } from "./upi-parser";
 import { mergeResults, parseRowsDetailed, parseTextDetailed } from "./upi-parser";
+import {
+  mergeDebitResults,
+  parseDebitsFromRows,
+  parseDebitsFromText,
+  type DebitResult,
+} from "./debit-parser";
+
+export type CombinedResult = { credit: ExtractResult; debit: DebitResult };
+
+function fromText(text: string): CombinedResult {
+  return { credit: parseTextDetailed(text), debit: parseDebitsFromText(text) };
+}
+
+function fromRows(rows: Row[]): CombinedResult {
+  return { credit: parseRowsDetailed(rows), debit: parseDebitsFromRows(rows) };
+}
+
+export function mergeCombined(list: CombinedResult[]): CombinedResult {
+  return {
+    credit: mergeResults(list.map((l) => l.credit)),
+    debit: mergeDebitResults(list.map((l) => l.debit)),
+  };
+}
 
 
 async function loadPdfjs() {
@@ -91,14 +114,14 @@ export type ExtractProgress = (stage: string) => void;
 export async function extractFromFile(
   file: File,
   onProgress?: ExtractProgress,
-): Promise<ExtractResult> {
+): Promise<CombinedResult> {
   const name = file.name.toLowerCase();
   const isImage =
     file.type.startsWith("image/") || /\.(jpg|jpeg|png|webp|bmp|tiff?)$/.test(name);
 
   if (isImage) {
     onProgress?.("Reading scanned image…");
-    return parseTextDetailed(await ocr([await fileToDataUrl(file)]));
+    return fromText(await ocr([await fileToDataUrl(file)]));
   }
 
   if (name.endsWith(".pdf") || file.type === "application/pdf") {
@@ -107,12 +130,12 @@ export async function extractFromFile(
     const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
     const { text, sparsePages } = await pdfText(doc);
 
-    const parts: ExtractResult[] = [];
-    if (text.replace(/\s/g, "").length) parts.push(parseTextDetailed(text));
+    const parts: CombinedResult[] = [];
+    if (text.replace(/\s/g, "").length) parts.push(fromText(text));
 
     let ocrPages = sparsePages;
     // No UPI credit found in the text layer: fall back to OCR of the whole document.
-    if (!ocrPages.length && !(parts[0]?.rows.length ?? 0)) {
+    if (!ocrPages.length && !(parts[0]?.credit.rows.length ?? 0)) {
       ocrPages = Array.from({ length: doc.numPages }, (_, i) => i + 1);
     }
 
@@ -120,17 +143,17 @@ export async function extractFromFile(
       onProgress?.(`Running OCR on ${Math.min(ocrPages.length, 12)} page(s)…`);
       const images: string[] = [];
       for (const p of ocrPages.slice(0, 12)) images.push(await pageToDataUrl(doc, p));
-      parts.push(parseTextDetailed(await ocr(images)));
+      parts.push(fromText(await ocr(images)));
     }
-    return mergeResults(parts.length ? parts : [parseTextDetailed("")]);
+    return mergeCombined(parts.length ? parts : [fromText("")]);
   }
 
   if (name.endsWith(".xls") || name.endsWith(".xlsx") || name.endsWith(".csv")) {
     onProgress?.("Reading spreadsheet…");
-    return parseRowsDetailed(await readSheetRows(file));
+    return fromRows(await readSheetRows(file));
   }
 
   onProgress?.("Reading text…");
-  return parseTextDetailed(await file.text());
+  return fromText(await file.text());
 }
 
