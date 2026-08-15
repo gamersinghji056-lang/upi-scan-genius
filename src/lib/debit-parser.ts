@@ -232,6 +232,16 @@ function analyzeDebits(rowsIn: Row[]): DebitResult {
       const c = CREDIT_WORDS.test(narration);
       if (d && !c) isDebit = true;
     }
+    // Last resort: a mode-bearing row with a single amount, no balance chain to
+    // compare against and no credit evidence anywhere is a debit.
+    if (
+      !isDebit &&
+      delta === null &&
+      nonBalance.length === 1 &&
+      !CREDIT_WORDS.test(text.replace(MODE_PATTERNS[3]!.re, " "))
+    ) {
+      isDebit = true;
+    }
     if (!isDebit) continue;
 
     if (amount === null && rowCols?.amount !== undefined) {
