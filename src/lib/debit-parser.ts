@@ -52,6 +52,8 @@ function toNumber(s: string) {
 function moneyTokens(text: string): string[] {
   const cleaned = text
     .replace(/\d{1,4}[-/.]\d{1,2}[-/.]\d{2,4}/g, " ")
+    // digits glued to letters (P2A, TRTR12, KKBKH2535) are never money
+    .replace(/[A-Za-z]+[\d.,]+[A-Za-z]*|[\d.,]+[A-Za-z]+/g, " ")
     .replace(/(?<!\d)\d{7,}(?!\d)/g, " ")
     .replace(/(?<!\d)\d{5,6}(?![\d.,])/g, " ");
   return cleaned.match(MONEY_RE) ?? [];
