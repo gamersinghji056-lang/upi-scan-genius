@@ -1,11 +1,15 @@
 /* ------------------------------------------------------------------ *
- * Debit extraction engine — separate from the UPI credit parser.
- * Supports UPI, IMPS, NEFT and RTGS debits, bank independent.
+ * Debit extraction engine — separate from the working UPI credit parser.
  *
- * IMPORTANT:
- * - Existing UPI credit parser is untouched.
- * - Debit reference extraction is intentionally flexible.
- * - References are selected from the SAME transaction row only.
+ * Supports Debit:
+ *   UPI + IMPS + NEFT + RTGS
+ *
+ * Design goals:
+ * - Do NOT touch credit logic.
+ * - Transaction direction is decided independently from reference extraction.
+ * - A valid debit must NOT disappear only because a UTR/reference is absent.
+ * - Search reference only inside the SAME transaction row.
+ * - Support real-world Indian bank narration aliases seen in statement files.
  * ------------------------------------------------------------------ */
 
 import { detectColumns, extractDate, type ColumnMap, type Row } from "./upi-parser";
@@ -14,7 +18,7 @@ export type DebitMode = "UPI" | "IMPS" | "NEFT" | "RTGS";
 
 export type DebitTxn = {
   date: string;
-  utr: string;
+  utr: string; // "N/A" when statement does not expose a usable reference
   amount: string;
   mode: DebitMode;
 };
@@ -26,14 +30,28 @@ export type DebitResult = {
 /* ---------------------------- vocabulary --------------------------- */
 
 const MODE_PATTERNS: Array<{ mode: DebitMode; re: RegExp }> = [
-  { mode: "RTGS", re: /\brtgs\b|rtgs[\s/\-:_]/i },
-  { mode: "NEFT", re: /\b(neft|ibneft|eneft)\b|neft[\s/\-:_]/i },
-  { mode: "IMPS", re: /\bimps\b|imps[\s/\-:_]/i },
-  { mode: "UPI", re: /\bupi\b|upi[\s/\-:_]|\bbhim\b|\bmpay\s*\/\s*upi\b/i },
+  {
+    mode: "RTGS",
+    re: /\b(rtgs|ibrtgs|ertgs)\b|(?:^|[\s/_:-])(rtgs|ibrtgs|ertgs)(?:$|[\s/_:-])/i,
+  },
+  {
+    mode: "NEFT",
+    re: /\b(neft|ibneft|eneft)\b|(?:^|[\s/_:-])(neft|ibneft|eneft)(?:$|[\s/_:-])/i,
+  },
+  {
+    mode: "IMPS",
+    re:
+      /\bimps\b|imps[\s/_:-]|(?:^|[\s/_:-])ps[\s/_:-]*p2a(?:$|[\s/_:-])|(?:^|[\s/_:-])psp2a(?:$|[\s/_:-])|(?:^|[\s/_:-])impsp2a(?:$|[\s/_:-])|(?:^|[\s/_:-])p2a(?:$|[\s/_:-])/i,
+  },
+  {
+    mode: "UPI",
+    re:
+      /\bupi\b|upi[\s/_:-]|\bbhim\b|\bmpay[\s/_:-]*upi\b|\bupi[\s/_:-]*rrn\b|\btrtr\b/i,
+  },
 ];
 
 const EXCLUDE_RE =
-  /\b(atm|cash\s*wdl|cash\s*withdrawal|cheque|chq|clg|card\s*payment|pos\s|debit\s*card|credit\s*card|charges?|gst|interest|emi|ecs\b|ach\b)\b/i;
+  /\b(atm|cash\s*wdl|cash\s*withdrawal|cheque|chq|clg|card\s*payment|pos\s|debit\s*card|credit\s*card|charges?|gst|interest|emi|ecs\b|ach\b|self\b)\b/i;
 
 const DEBIT_WORDS =
   /\b(dr|debit|debits|debited|withdraw|withdrawal|withdrawals|withdrawn|sent|paid|payment|payments|transfer\s*out|outgoing|outward|out)\b/i;
@@ -44,15 +62,15 @@ const CREDIT_WORDS =
 const BALANCE_WORDS = /\b(balance|bal|closing|running|available)\b/i;
 
 const EXPLICIT_REF_RE =
-  /\b(utr|rrn|upi\s*ref(?:erence)?|imps\s*ref(?:erence)?|neft\s*ref(?:erence)?|rtgs\s*ref(?:erence)?|ref(?:erence)?(?:\s*(?:no|num|number))?|txn\s*ref(?:erence)?|transaction\s*ref(?:erence)?|txn\s*id|transaction\s*id|trn)\b/i;
+  /\b(utr|xutr|rrn|upi\s*ref(?:erence)?|imps\s*ref(?:erence)?|neft\s*ref(?:erence)?|rtgs\s*ref(?:erence)?|ref(?:erence)?(?:\s*(?:no|num|number))?|txn\s*ref(?:erence)?|transaction\s*ref(?:erence)?|txn\s*id|transaction\s*id|trn|inst(?:rument)?\s*no)\b/i;
 
 const BAD_REF_CONTEXT =
-  /(a\/?c|acct|account|ben(?:eficiary)?|mobile|phone|ifsc|vpa|balance|bal\b|amount|amt|date|time)/i;
+  /(a\/?c|acct|account|ben(?:eficiary)?|mobile|phone|ifsc|vpa|balance|bal\b|amount|amt|date|time|customer|cif)/i;
 
 /* ------------------------------ money ------------------------------ */
 
 const MONEY_RE =
-  /(?<![\d.])(\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?!\d)/g;
+  /(?<![\d.])(-?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)(?!\d)/g;
 
 function toNumber(s: string) {
   return Number(s.replace(/,/g, ""));
@@ -62,8 +80,7 @@ function moneyTokens(text: string): string[] {
   const cleaned = text
     .replace(/\d{1,4}[-/.]\d{1,2}[-/.]\d{2,4}/g, " ")
     .replace(/[A-Za-z]+[\d.,]+[A-Za-z]*|[\d.,]+[A-Za-z]+/g, " ")
-    .replace(/(?<!\d)\d{7,}(?!\d)/g, " ")
-    .replace(/(?<!\d)\d{5,6}(?![\d.,])/g, " ");
+    .replace(/(?<!\d)\d{7,}(?!\d)/g, " ");
 
   return cleaned.match(MONEY_RE) ?? [];
 }
@@ -71,12 +88,14 @@ function moneyTokens(text: string): string[] {
 function cellAmount(cell: string): number | null {
   const t = moneyTokens(cell);
   if (!t.length) return null;
-  const n = toNumber(t[t.length - 1] ?? "");
+
+  // Prefer the first transaction-looking numeric in an isolated table cell.
+  const n = toNumber(t[0] ?? "");
   return Number.isFinite(n) ? n : null;
 }
 
 function fmtAmount(n: number) {
-  return n.toFixed(2);
+  return Math.abs(n).toFixed(2);
 }
 
 /* --------------------------- mode detect --------------------------- */
@@ -91,6 +110,7 @@ export function detectMode(text: string): DebitMode | null {
 /* -------------------------- reference engine ----------------------- */
 
 type CandidateSource =
+  | "dedicated-column"
   | "explicit"
   | "mode-pattern"
   | "token"
@@ -104,16 +124,13 @@ type Candidate = {
   score: number;
 };
 
-/**
- * Normalizes a reference without destroying meaningful alphanumeric content.
- * We strip surrounding punctuation but keep internal -, _, / because some
- * bank-generated references contain separators.
- */
 function cleanRef(value: string): string {
   return value
     .trim()
     .replace(/^[\s:;,.()[\]{}<>|]+/, "")
-    .replace(/[\s:;,.()[\]{}<>|]+$/, "");
+    .replace(/[\s:;,.()[\]{}<>|]+$/, "")
+    .replace(/^[-_/]+/, "")
+    .replace(/[-_/]+$/, "");
 }
 
 function looksLikeIfsc(v: string): boolean {
@@ -125,47 +142,42 @@ function looksLikeDate(v: string): boolean {
 }
 
 function looksLikeMoney(v: string): boolean {
-  return /^\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?$/.test(v) ||
-    /^\d+\.\d{1,2}$/.test(v);
+  return /^-?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?$/.test(v) ||
+    /^-?\d+\.\d{1,2}$/.test(v);
 }
 
 function looksLikeMobile(v: string): boolean {
   return /^[6-9]\d{9}$/.test(v);
 }
 
-function looksLikePureAccountNumber(v: string): boolean {
+function looksLikeAccountNumber(v: string): boolean {
   return /^\d{14,22}$/.test(v);
 }
 
 function hasEnoughReferenceSignal(v: string): boolean {
   const compact = v.replace(/[-_/]/g, "");
-  return compact.length >= 8 && compact.length <= 40 && /\d/.test(compact);
+  return compact.length >= 8 && compact.length <= 48 && /\d/.test(compact);
 }
 
-/**
- * Extract values appearing immediately after explicit labels such as:
- * UTR: XXXXX
- * RRN 123456789012
- * Ref No - ABC123...
- */
 function explicitReferenceCandidates(text: string): Candidate[] {
   const out: Candidate[] = [];
 
   const re =
-    /\b(UTR|RRN|UPI\s*REF(?:ERENCE)?|IMPS\s*REF(?:ERENCE)?|NEFT\s*REF(?:ERENCE)?|RTGS\s*REF(?:ERENCE)?|REF(?:ERENCE)?(?:\s*(?:NO|NUM|NUMBER))?|TXN\s*REF(?:ERENCE)?|TRANSACTION\s*REF(?:ERENCE)?|TXN\s*ID|TRANSACTION\s*ID|TRN)\b[\s:#=\-\/]*([A-Z0-9][A-Z0-9_\/\-]{6,45})/gi;
+    /\b(UTR|XUTR|RRN|UPI\s*REF(?:ERENCE)?|IMPS\s*REF(?:ERENCE)?|NEFT\s*REF(?:ERENCE)?|RTGS\s*REF(?:ERENCE)?|REF(?:ERENCE)?(?:\s*(?:NO|NUM|NUMBER))?|TXN\s*REF(?:ERENCE)?|TRANSACTION\s*REF(?:ERENCE)?|TXN\s*ID|TRANSACTION\s*ID|TRN|INST(?:RUMENT)?\s*NO)\b[\s:#=\-\/]*([A-Z0-9][A-Z0-9_\/\-]{6,47})/gi;
 
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const value = cleanRef(m[2] ?? "");
     if (!value || !hasEnoughReferenceSignal(value)) continue;
 
-    let score = 150;
+    let score = 170;
     const label = (m[1] ?? "").toUpperCase();
-    if (label === "UTR") score += 60;
-    else if (label === "RRN") score += 50;
-    else if (/UPI|IMPS|NEFT|RTGS/.test(label)) score += 40;
-    else if (/REF/.test(label)) score += 25;
-    else if (/ID|TRN/.test(label)) score += 15;
+
+    if (label === "UTR" || label === "XUTR") score += 70;
+    else if (label === "RRN") score += 60;
+    else if (/UPI|IMPS|NEFT|RTGS/.test(label)) score += 50;
+    else if (/REF/.test(label)) score += 30;
+    else if (/ID|TRN|INST/.test(label)) score += 20;
 
     out.push({
       value,
@@ -178,24 +190,16 @@ function explicitReferenceCandidates(text: string): Candidate[] {
   return out;
 }
 
-/**
- * Extract mode-specific references from common bank narration shapes.
- * Examples:
- * UPI/123456789012/...
- * MPAY/UPI/TRTR/870538678930/...
- * IMPS/P2A/607813136431/...
- * NEFT-BARBL26078306964-...
- * RTGS-BARBR52026031900028575-...
- */
 function modeSpecificCandidates(text: string, mode: DebitMode): Candidate[] {
   const out: Candidate[] = [];
 
-  const pushMatch = (re: RegExp, baseScore: number) => {
+  const push = (re: RegExp, baseScore: number) => {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
       const raw = m[1] ?? "";
       const value = cleanRef(raw);
       if (!value || !hasEnoughReferenceSignal(value)) continue;
+
       out.push({
         value,
         index: m.index + (m[0]?.lastIndexOf(raw) ?? 0),
@@ -206,62 +210,75 @@ function modeSpecificCandidates(text: string, mode: DebitMode): Candidate[] {
   };
 
   if (mode === "UPI") {
-    pushMatch(/\bUPI[\s\/:_-]+(?:CR[\s\/:_-]+|DR[\s\/:_-]+|P2A[\s\/:_-]+|P2M[\s\/:_-]+|PAY[\s\/:_-]+|PAYMENT[\s\/:_-]+|COLLECT[\s\/:_-]+|TRTR[\s\/:_-]+)*([0-9]{12})(?!\d)/gi, 130);
-    pushMatch(/\bMPAY[\s\/:_-]+UPI[\s\/:_-]+(?:TRTR[\s\/:_-]+)?([0-9]{12})(?!\d)/gi, 145);
-    pushMatch(/\bBHIM[\s\/:_-]+UPI[\s\/:_-]+([0-9]{12})(?!\d)/gi, 135);
+    push(/\bUPI[\s/_:-]+RRN[\s/_:-]*([0-9]{12})(?!\d)/gi, 180);
+    push(/\bUPI[\s/_:-]+(?:CR[\s/_:-]+|DR[\s/_:-]+)?([0-9]{12})(?!\d)/gi, 165);
+    push(/\bMPAY[\s/_:-]+UPI[\s/_:-]+(?:TRTR[\s/_:-]+)?([0-9]{12})(?!\d)/gi, 190);
+    push(/\bTRTR[\s/_:-]+([0-9]{12})(?!\d)/gi, 175);
+    push(/\bBHIM[\s/_:-]+UPI[\s/_:-]+([0-9]{12})(?!\d)/gi, 165);
   }
 
   if (mode === "IMPS") {
-    pushMatch(/\bIMPS[\s\/:_-]+(?:P2A[\s\/:_-]+|P2P[\s\/:_-]+)?([0-9]{10,18})(?!\d)/gi, 140);
+    push(/\bIMPS[\s/_:-]+(?:P2A[\s/_:-]+|P2P[\s/_:-]+)?([0-9]{10,18})(?!\d)/gi, 185);
+    push(/\bPS[\s/_:-]*P2A[\s/_:-]+([0-9]{10,18})(?!\d)/gi, 180);
+    push(/\bPSP2A([0-9]{10,18})(?!\d)/gi, 180);
+    push(/\bIMPSP2A([0-9]{10,18})(?!\d)/gi, 180);
   }
 
   if (mode === "NEFT") {
-    pushMatch(/\b(?:IBNEFT|ENEFT|NEFT)[\s\/:_-]+([A-Z0-9][A-Z0-9_-]{8,35})/gi, 145);
-    pushMatch(/\b([A-Z]{2,8}[A-Z]?\d{8,30})\b/gi, 85);
+    // NEFT_OUT:PUNBN62025121456687398/...
+    push(/\bNEFT[\s_/-]*OUT[\s:/_-]+([A-Z0-9][A-Z0-9_-]{8,40})/gi, 200);
+
+    // NEFT-BARBL26078306964-...
+    push(/\b(?:IBNEFT|ENEFT|NEFT)[\s:/_-]+([A-Z0-9][A-Z0-9_-]{8,40})/gi, 185);
+
+    // /XUTR/AXNH261850049792
+    push(/\bXUTR[\s:/_-]+([A-Z0-9][A-Z0-9_-]{8,40})/gi, 210);
+
+    // Generic Indian bank-prefixed NEFT UTR.
+    push(/\b([A-Z]{3,8}[A-Z]?\d{8,30})\b/gi, 115);
   }
 
   if (mode === "RTGS") {
-    pushMatch(/\bRTGS[\s\/:_-]+([A-Z0-9][A-Z0-9_-]{8,40})/gi, 150);
-    pushMatch(/\b([A-Z]{2,8}R?\d{10,32})\b/gi, 90);
+    // RTGS-BARBR52026031900028575-...
+    push(/\b(?:IBRTGS|ERTGS|RTGS)[\s:/_-]+([A-Z0-9][A-Z0-9_-]{8,44})/gi, 195);
+
+    // MAHBR52026061124182338
+    push(/\b([A-Z]{3,8}R\d{10,32})\b/gi, 150);
+    push(/\b([A-Z]{4,8}\d{10,32})\b/gi, 125);
   }
 
   return out;
 }
 
-/**
- * Generic candidate extraction. This is deliberately more permissive than
- * the old 8-32 continuous alphanumeric regex because bank references can
- * contain separators or can be split by PDF text extraction.
- */
 function genericCandidates(text: string): Candidate[] {
   const out: Candidate[] = [];
 
-  // Numeric references — useful for UPI/IMPS and some bank-specific formats.
   const numeric = /(?<!\d)(\d{8,24})(?!\d)/g;
   let n: RegExpExecArray | null;
+
   while ((n = numeric.exec(text)) !== null) {
     const value = n[1] ?? "";
     out.push({
       value,
       index: n.index,
       source: "numeric",
-      score: /^\d{12}$/.test(value) ? 85 : 35,
+      score: /^\d{12}$/.test(value) ? 90 : 35,
     });
   }
 
-  // Alphanumeric references, allowing -, _, / internally.
   const token =
-    /(?<![A-Za-z0-9])([A-Za-z0-9][A-Za-z0-9_\/\-]{7,39})(?![A-Za-z0-9])/g;
+    /(?<![A-Za-z0-9])([A-Za-z0-9][A-Za-z0-9_\/\-]{7,47})(?![A-Za-z0-9])/g;
 
   let m: RegExpExecArray | null;
+
   while ((m = token.exec(text)) !== null) {
     const value = cleanRef(m[1] ?? "");
     if (!value || !hasEnoughReferenceSignal(value)) continue;
 
     let score = 20;
-    if (/^[A-Za-z]{2,8}[A-Za-z]?\d{6,}$/i.test(value.replace(/[-_/]/g, ""))) {
-      score += 45;
-    }
+
+    const compact = value.replace(/[-_/]/g, "");
+    if (/^[A-Za-z]{2,10}\d{6,}$/i.test(compact)) score += 55;
 
     out.push({
       value,
@@ -280,6 +297,7 @@ function uniqueCandidates(list: Candidate[]): Candidate[] {
   for (const candidate of list) {
     const key = candidate.value.toUpperCase();
     const current = seen.get(key);
+
     if (!current || candidate.score > current.score) {
       seen.set(key, candidate);
     }
@@ -296,69 +314,120 @@ function scoreCandidate(
   const value = candidate.value;
   let score = candidate.score;
 
-  const before = text.slice(Math.max(0, candidate.index - 45), candidate.index);
+  const before = text.slice(Math.max(0, candidate.index - 50), candidate.index);
   const after = text.slice(
     candidate.index + value.length,
-    candidate.index + value.length + 30,
+    candidate.index + value.length + 35,
   );
   const nearby = `${before} ${after}`;
 
-  if (EXPLICIT_REF_RE.test(before)) score += 75;
-  if (BAD_REF_CONTEXT.test(before)) score -= 130;
+  if (EXPLICIT_REF_RE.test(before)) score += 90;
+  if (BAD_REF_CONTEXT.test(before)) score -= 140;
 
   if (/^\d{12}$/.test(value)) {
-    if (mode === "UPI" || mode === "IMPS") score += 65;
+    if (mode === "UPI" || mode === "IMPS") score += 80;
     else score += 15;
   }
 
   const compact = value.replace(/[-_/]/g, "");
+
   if (/^[A-Za-z]{2,10}\d{6,}$/i.test(compact)) {
-    if (mode === "NEFT" || mode === "RTGS") score += 70;
+    if (mode === "NEFT" || mode === "RTGS") score += 80;
     else score += 20;
   }
 
-  if (looksLikeIfsc(value)) score -= 300;
-  if (looksLikeDate(value)) score -= 300;
-  if (looksLikeMoney(value)) score -= 250;
-  if (looksLikeMobile(value)) score -= 160;
-  if (looksLikePureAccountNumber(value)) score -= 80;
+  if (looksLikeIfsc(value)) score -= 350;
+  if (looksLikeDate(value)) score -= 350;
+  if (looksLikeMoney(value)) score -= 300;
+  if (looksLikeMobile(value)) score -= 200;
+  if (looksLikeAccountNumber(value)) score -= 100;
 
-  if (/\b(?:account|acct|a\/c|beneficiary|mobile|phone|ifsc|vpa)\b/i.test(nearby)) {
-    score -= 50;
+  if (
+    /\b(?:account|acct|a\/c|beneficiary|mobile|phone|ifsc|vpa|customer|cif)\b/i.test(
+      nearby,
+    )
+  ) {
+    score -= 65;
   }
 
   const modeRe = MODE_PATTERNS.find((p) => p.mode === mode)?.re;
   const modeIdx = modeRe ? text.search(modeRe) : -1;
+
   if (modeIdx >= 0) {
     const distance = Math.abs(candidate.index - modeIdx);
-    score += Math.max(0, 70 - Math.floor(distance / 4));
+    score += Math.max(0, 85 - Math.floor(distance / 4));
   }
 
-  // References following slash-separated mode tokens deserve extra trust.
-  const left = text.slice(Math.max(0, candidate.index - 25), candidate.index);
-  if (mode === "UPI" && /(?:UPI|TRTR|P2A|P2M)[\s\/:_-]*$/i.test(left)) score += 55;
-  if (mode === "IMPS" && /(?:IMPS|P2A|P2P)[\s\/:_-]*$/i.test(left)) score += 55;
-  if (mode === "NEFT" && /(?:NEFT|IBNEFT|ENEFT)[\s\/:_-]*$/i.test(left)) score += 60;
-  if (mode === "RTGS" && /RTGS[\s\/:_-]*$/i.test(left)) score += 60;
+  const left = text.slice(Math.max(0, candidate.index - 30), candidate.index);
+
+  if (mode === "UPI" && /(?:UPI|RRN|TRTR|P2A|P2M)[\s/_:-]*$/i.test(left)) {
+    score += 65;
+  }
+
+  if (mode === "IMPS" && /(?:IMPS|PS|P2A|P2P|PSP2A|IMPSP2A)[\s/_:-]*$/i.test(left)) {
+    score += 65;
+  }
+
+  if (mode === "NEFT" && /(?:NEFT|IBNEFT|ENEFT|XUTR|OUT)[\s/_:-]*$/i.test(left)) {
+    score += 70;
+  }
+
+  if (mode === "RTGS" && /(?:RTGS|IBRTGS|ERTGS)[\s/_:-]*$/i.test(left)) {
+    score += 70;
+  }
 
   return score;
 }
 
-/**
- * Public reference extractor.
- *
- * Priority:
- * 1. Explicit UTR/RRN/Ref labels
- * 2. Mode-specific narration patterns
- * 3. Flexible same-row candidate scoring
- *
- * We do NOT require one universal length or one universal bank prefix.
- */
-export function extractDebitRef(text: string, mode: DebitMode): string | null {
+function extractRefFromDedicatedCells(
+  cells: Row,
+  cols: ColumnMap | null,
+): string | null {
+  if (!cols) return null;
+
+  // The existing ColumnMap does not expose a dedicated ref index, so inspect
+  // non-date/non-amount cells that look like an isolated bank reference.
+  for (let i = 0; i < cells.length; i++) {
+    if (
+      i === cols.date ||
+      i === cols.credit ||
+      i === cols.debit ||
+      i === cols.amount ||
+      i === cols.balance ||
+      i === cols.type
+    ) {
+      continue;
+    }
+
+    const cell = cleanRef(cells[i] || "");
+    if (!cell || /\s/.test(cell)) continue;
+    if (!hasEnoughReferenceSignal(cell)) continue;
+    if (looksLikeIfsc(cell) || looksLikeDate(cell) || looksLikeMoney(cell)) continue;
+
+    if (
+      /^\d{12}$/.test(cell) ||
+      /^[A-Za-z]{3,10}\d{8,30}$/i.test(cell.replace(/[-_/]/g, ""))
+    ) {
+      return cell;
+    }
+  }
+
+  return null;
+}
+
+export function extractDebitRef(
+  text: string,
+  mode: DebitMode,
+  cells?: Row,
+  cols?: ColumnMap | null,
+): string | null {
+  const dedicated = cells ? extractRefFromDedicatedCells(cells, cols ?? null) : null;
+  if (dedicated) return dedicated;
+
   const normalized = text
     .replace(/\u00a0/g, " ")
     .replace(/[–—]/g, "-")
-    .replace(/\s*([\/:_-])\s*/g, "$1")
+    .replace(/\s*([/:_-])\s*/g, "$1")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -391,19 +460,19 @@ export function extractDebitRef(text: string, mode: DebitMode): string | null {
 
   const best = scored[0];
 
-  // Keep a small positive threshold to avoid random account/mobile numbers,
-  // but do not use the previous overly-strict rejection behaviour.
-  if (!best || best.score < 20) return null;
+  if (!best || best.score < 25) return null;
 
   return best.candidate.value;
 }
 
-/* ------------------------------ engine ------------------------------ */
+/* --------------------------- row amount utils ---------------------- */
 
-function rowValues(
-  cells: Row,
-  cols: ColumnMap | null,
-): Array<{ index: number; value: number }> {
+type RowValue = {
+  index: number;
+  value: number;
+};
+
+function rowValues(cells: Row, cols: ColumnMap | null): RowValue[] {
   if (cells.length === 1) {
     return moneyTokens(cells[0] || "").map((t, i) => ({
       index: i,
@@ -411,10 +480,11 @@ function rowValues(
     }));
   }
 
-  const out: Array<{ index: number; value: number }> = [];
+  const out: RowValue[] = [];
 
   cells.forEach((cell, i) => {
     if (cols?.date === i || cols?.narration === i) return;
+
     const v = cellAmount(cell || "");
     if (v !== null) out.push({ index: i, value: v });
   });
@@ -422,8 +492,161 @@ function rowValues(
   return out;
 }
 
+/* --------------------------- direction engine ---------------------- */
+
+/**
+ * Direction priority:
+ * 1. Dedicated debit/credit columns
+ * 2. Explicit row type field (DR/CR)
+ * 3. Negative transaction amount
+ * 4. Balance delta
+ * 5. Narration keywords only as final fallback
+ *
+ * IMPORTANT:
+ * A trailing CR/DR attached to BALANCE is NOT treated as transaction direction.
+ */
+function classifyDebit(
+  cells: Row,
+  text: string,
+  cols: ColumnMap | null,
+  prevBalance: number | null,
+): {
+  isDebit: boolean;
+  amount: number | null;
+  balance: number | null;
+} {
+  const values = rowValues(cells, cols);
+
+  let balance: number | null = null;
+  let balanceIdx: number | null = null;
+
+  if (cols?.balance !== undefined) {
+    const v = cellAmount(cells[cols.balance] || "");
+    if (v !== null) {
+      balance = Math.abs(v);
+      balanceIdx = cols.balance;
+    }
+  } else if (values.length >= 2) {
+    const last = values[values.length - 1]!;
+    balance = Math.abs(last.value);
+    balanceIdx = last.index;
+  }
+
+  // 1. Dedicated Debit/Credit columns are authoritative.
+  const debitCell =
+    cols?.debit !== undefined ? cellAmount(cells[cols.debit] || "") : null;
+
+  const creditCell =
+    cols?.credit !== undefined ? cellAmount(cells[cols.credit] || "") : null;
+
+  if (debitCell !== null && debitCell !== 0) {
+    return {
+      isDebit: true,
+      amount: Math.abs(debitCell),
+      balance,
+    };
+  }
+
+  if (creditCell !== null && creditCell !== 0) {
+    return {
+      isDebit: false,
+      amount: Math.abs(creditCell),
+      balance,
+    };
+  }
+
+  // 2. Explicit type column or standalone DR/CR cell.
+  const typeCell =
+    cols?.type !== undefined ? cells[cols.type] || "" : "";
+
+  const indicator =
+    typeCell ||
+    cells.find((c) => /^\s*(dr|debit|cr|credit|d|c)\.?\s*$/i.test(c || "")) ||
+    "";
+
+  if (indicator) {
+    if (/^\s*(dr|debit|d)\.?\s*$/i.test(indicator)) {
+      const nonBalance = values.filter((v) => v.index !== balanceIdx);
+      const candidate = nonBalance.find((v) => Math.abs(v.value) > 0);
+      return {
+        isDebit: true,
+        amount: candidate ? Math.abs(candidate.value) : null,
+        balance,
+      };
+    }
+
+    if (/^\s*(cr|credit|c)\.?\s*$/i.test(indicator)) {
+      return {
+        isDebit: false,
+        amount: null,
+        balance,
+      };
+    }
+  }
+
+  const nonBalance = values.filter((v) => v.index !== balanceIdx);
+
+  // 3. Negative transaction amount is strong debit evidence.
+  const negative = nonBalance.find((v) => v.value < 0);
+  if (negative) {
+    return {
+      isDebit: true,
+      amount: Math.abs(negative.value),
+      balance,
+    };
+  }
+
+  // 4. Balance delta.
+  if (balance !== null && prevBalance !== null) {
+    const delta = Number((balance - prevBalance).toFixed(2));
+
+    if (delta < 0) {
+      const match = nonBalance.find(
+        (v) => Math.abs(Math.abs(v.value) - Math.abs(delta)) < 0.02,
+      );
+
+      return {
+        isDebit: true,
+        amount: match ? Math.abs(match.value) : Math.abs(delta),
+        balance,
+      };
+    }
+
+    if (delta > 0) {
+      return {
+        isDebit: false,
+        amount: null,
+        balance,
+      };
+    }
+  }
+
+  // 5. Narration keyword fallback only when there is no contradictory evidence.
+  const narrationOnly = text.replace(BALANCE_WORDS, " ");
+  const d = DEBIT_WORDS.test(narrationOnly);
+  const c = CREDIT_WORDS.test(narrationOnly);
+
+  if (d && !c) {
+    const candidate = nonBalance.find((v) => Math.abs(v.value) > 0);
+    return {
+      isDebit: true,
+      amount: candidate ? Math.abs(candidate.value) : null,
+      balance,
+    };
+  }
+
+  return {
+    isDebit: false,
+    amount: null,
+    balance,
+  };
+}
+
+/* ------------------------------ engine ------------------------------ */
+
 function analyzeDebits(rowsIn: Row[]): DebitResult {
   const results: DebitTxn[] = [];
+
   let cols: ColumnMap | null = null;
   let headerLen = 0;
   let prevBalance: number | null = null;
@@ -432,6 +655,7 @@ function analyzeDebits(rowsIn: Row[]): DebitResult {
     const cells = raw.map((c) =>
       c == null ? "" : String(c).replace(/\s+/g, " ").trim(),
     );
+
     const text = cells.join(" ").trim();
 
     if (!text) continue;
@@ -442,11 +666,12 @@ function analyzeDebits(rowsIn: Row[]): DebitResult {
       )
     ) {
       const t = moneyTokens(text);
-      if (t.length) prevBalance = toNumber(t[t.length - 1] ?? "");
+      if (t.length) prevBalance = Math.abs(toNumber(t[t.length - 1] ?? ""));
       continue;
     }
 
     const maybeHeader = detectColumns(cells);
+
     if (maybeHeader && extractDate(text) === null) {
       cols = maybeHeader;
       headerLen = cells.length;
@@ -467,151 +692,86 @@ function analyzeDebits(rowsIn: Row[]): DebitResult {
 
     const values = rowValues(cells, rowCols);
 
-    let balance: number | null = null;
-    let balanceIdx: number | null = null;
+    let currentBalance: number | null = null;
 
     if (rowCols?.balance !== undefined) {
       const v = cellAmount(cells[rowCols.balance] || "");
-      if (v !== null) {
-        balance = v;
-        balanceIdx = rowCols.balance;
-      }
+      if (v !== null) currentBalance = Math.abs(v);
     } else if (values.length >= 2) {
-      const last = values[values.length - 1]!;
-      balance = last.value;
-      balanceIdx = last.index;
+      currentBalance = Math.abs(values[values.length - 1]!.value);
     }
 
-    const nonBalance = values.filter(
-      (v) => v.index !== balanceIdx && v.value > 0,
-    );
+    const previousBalance = prevBalance;
+    if (currentBalance !== null) prevBalance = currentBalance;
 
-    const delta =
-      balance !== null && prevBalance !== null
-        ? Number((balance - prevBalance).toFixed(2))
-        : null;
-
-    const prev = prevBalance;
-    if (balance !== null) prevBalance = balance;
-
+    // Exclude obvious non-payment debit categories.
+    // But do not exclude "payment" itself because UPI/IMPS debit narration may use it.
     if (EXCLUDE_RE.test(text)) continue;
 
     const mode = detectMode(text);
     if (!mode) continue;
 
-    let isDebit = false;
-    let amount: number | null = null;
+    const classified = classifyDebit(
+      cells,
+      text,
+      rowCols,
+      previousBalance,
+    );
 
-    const debitCell =
-      rowCols?.debit !== undefined
-        ? cellAmount(cells[rowCols.debit] || "")
-        : null;
+    if (!classified.isDebit) continue;
 
-    const creditCell =
-      rowCols?.credit !== undefined
-        ? cellAmount(cells[rowCols.credit] || "")
-        : null;
+    let amount = classified.amount;
 
-    if (debitCell && debitCell > 0) {
-      isDebit = true;
-      amount = debitCell;
-    } else if (creditCell && creditCell > 0) {
-      continue;
+    if ((amount === null || amount <= 0) && rowCols?.amount !== undefined) {
+      const a = cellAmount(cells[rowCols.amount] || "");
+      if (a !== null) amount = Math.abs(a);
     }
 
-    const typeCell =
-      rowCols?.type !== undefined ? cells[rowCols.type] || "" : "";
-
-    const indicator =
-      typeCell ||
-      cells.find((c) => /^\s*(cr|dr|c|d)\.?\s*$/i.test(c || "")) ||
-      "";
-
-    if (!isDebit && indicator) {
-      if (DEBIT_WORDS.test(indicator) && !CREDIT_WORDS.test(indicator)) {
-        isDebit = true;
-      } else if (CREDIT_WORDS.test(indicator)) {
-        continue;
-      }
-    }
-
-    if (delta !== null && Math.abs(delta) > 0) {
-      const match = nonBalance.find(
-        (v) => Math.abs(v.value - Math.abs(delta)) < 0.02,
+    if (amount === null || amount <= 0) {
+      const nonBalance = values.filter(
+        (v) =>
+          rowCols?.balance === undefined ||
+          v.index !== rowCols.balance,
       );
 
-      if (match) {
-        if (delta > 0) continue;
-        isDebit = true;
-        amount = amount ?? match.value;
-      }
-    }
+      const candidate =
+        nonBalance.find((v) => v.value < 0) ??
+        nonBalance.find((v) => Math.abs(v.value) > 0);
 
-    if (!isDebit) {
-      const narration = text.replace(BALANCE_WORDS, " ");
-      const d = DEBIT_WORDS.test(narration);
-      const c = CREDIT_WORDS.test(narration);
-      if (d && !c) isDebit = true;
-    }
-
-    if (
-      !isDebit &&
-      delta === null &&
-      nonBalance.length === 1 &&
-      !CREDIT_WORDS.test(text)
-    ) {
-      isDebit = true;
-    }
-
-    if (!isDebit) continue;
-
-    if (amount === null && rowCols?.amount !== undefined) {
-      amount = cellAmount(cells[rowCols.amount] || "");
-    }
-
-    if (amount === null) {
-      if (nonBalance.length === 1) amount = nonBalance[0]!.value;
-      else if (nonBalance.length > 1) amount = nonBalance[0]!.value;
+      if (candidate) amount = Math.abs(candidate.value);
     }
 
     if (!amount || amount <= 0) continue;
 
-    if (
-      prev !== null &&
-      balance !== null &&
-      Math.abs(amount - balance) < 0.001 &&
-      nonBalance.length === 0
-    ) {
-      continue;
-    }
-
-    // Search across ALL cells belonging to the SAME row.
-    const utr = extractDebitRef(text, mode);
-    if (!utr) continue;
+    // Reference extraction is independent from debit validity.
+    const ref = extractDebitRef(text, mode, cells, rowCols);
 
     results.push({
       date,
-      utr,
+      utr: ref ?? "N/A",
       amount: fmtAmount(amount),
       mode,
     });
   }
 
-  return { rows: dedupeDebits(results) };
+  return {
+    rows: dedupeDebits(results),
+  };
 }
 
 /* ------------------------------ inputs ------------------------------ */
 
 /**
- * Some PDF/text statements wrap a single transaction across multiple visual
- * lines. If a line does not start a new dated transaction, append it to the
- * previous transaction row.
+ * Text/PDF statements frequently wrap one transaction across multiple lines.
+ * Any continuation line without a new transaction date is appended to the
+ * previous dated line.
  */
 function stitchLines(lines: string[]): string[] {
   const out: string[] = [];
 
   for (const raw of lines) {
     const line = raw.replace(/\u00a0/g, " ").trimEnd();
+
     if (!line.trim()) continue;
 
     if (extractDate(line) !== null || out.length === 0) {
@@ -664,11 +824,11 @@ function dedupeDebits(list: DebitTxn[]): DebitTxn[] {
   const seen = new Set<string>();
 
   return list.filter((r) => {
-    const k = `${r.date}|${r.utr}|${r.amount}|${r.mode}`;
+    const key = `${r.date}|${r.utr}|${r.amount}|${r.mode}`;
 
-    if (seen.has(k)) return false;
+    if (seen.has(key)) return false;
 
-    seen.add(k);
+    seen.add(key);
     return true;
   });
 }
