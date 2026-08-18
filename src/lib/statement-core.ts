@@ -1,49 +1,15 @@
 /* ========================================================================== *
- * UNIVERSAL INDIAN BANK STATEMENT CORE — V2
+ * UNIVERSAL INDIAN BANK STATEMENT CORE — V3
  *
- * READ -> RECONSTRUCT -> UNDERSTAND -> CLASSIFY -> VALIDATE
- *
- * Supported normalized sources:
- * - Native bank PDF text
- * - OCR PDF rows
- * - XLS / XLSX
- * - CSV
- * - TXT / fixed-width text
- *
- * IMPORTANT RULES
- *
- * 1. Mode NEVER decides debit / credit.
- * 2. Transaction DR/CR and Balance DR/CR are different.
- * 3. Dedicated Debit/Credit columns have highest authority.
- * 4. Valid transaction is NOT dropped because UTR is missing.
- * 5. Reverse-chronological statements are supported.
- * 6. One-cell flattened PDF rows are supported.
- * 7. UTR/reference is scored independently from direction and amount.
+ * One shared engine for PDF text/OCR, XLS/XLSX, CSV and TXT.
+ * Direction is determined independently from payment mode.
  * ========================================================================== */
 
 export type Row = string[];
-
-export type Direction =
-  | "credit"
-  | "debit"
-  | "unknown";
-
-export type PaymentMode =
-  | "UPI"
-  | "IMPS"
-  | "NEFT"
-  | "RTGS"
-  | "OTHER";
-
-export type Confidence =
-  | "high"
-  | "medium"
-  | "low";
-
-export type StatementOrder =
-  | "ascending"
-  | "descending"
-  | "unknown";
+export type Direction = "credit" | "debit" | "unknown";
+export type PaymentMode = "UPI" | "IMPS" | "NEFT" | "RTGS" | "OTHER";
+export type Confidence = "high" | "medium" | "low";
+export type StatementOrder = "ascending" | "descending" | "unknown";
 
 export type ColumnMap = {
   serial?: number;
@@ -92,324 +58,148 @@ export type CoreResult = {
   warnings: string[];
 };
 
-/* ========================================================================== *
- * NORMALIZATION
- * ========================================================================== */
+/* -------------------------------------------------------------------------- *
+ * Normalization
+ * -------------------------------------------------------------------------- */
 
-export function normalizeText(
-  value: unknown,
-): string {
-  return String(
-    value ?? "",
-  )
-    .replace(
-      /\u00a0/g,
-      " ",
-    )
-    .replace(
-      /[\u200B-\u200D\uFEFF]/g,
-      "",
-    )
-    .replace(
-      /[‐-‒–—]/g,
-      "-",
-    )
-    .replace(
-      /[“”]/g,
-      '"',
-    )
-    .replace(
-      /[‘’]/g,
-      "'",
-    )
-    .replace(
-      /\s+/g,
-      " ",
-    )
+export function normalizeText(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\u00a0/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[‐-‒–—]/g, "-")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-export function compactText(
-  value: unknown,
-): string {
-  return normalizeText(
-    value,
-  ).replace(
-    /\s*([/:_=\-])\s*/g,
-    "$1",
+export function compactText(value: unknown): string {
+  return normalizeText(value).replace(/\s*([/:_=\-])\s*/g, "$1");
+}
+
+function rowText(row: Row): string {
+  return normalizeText(row.join(" "));
+}
+
+/* -------------------------------------------------------------------------- *
+ * Date
+ * -------------------------------------------------------------------------- */
+
+const MONTHS: Record<string, string> = {
+  jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+  jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+};
+
+function pad2(value: string): string {
+  return value.padStart(2, "0");
+}
+
+function normalizeYear(value: string): string {
+  if (value.length === 4) return value;
+  return Number(value) >= 70 ? `19${value}` : `20${value}`;
+}
+
+export function excelSerialToDate(value: string): string | null {
+  const input = value.trim();
+  if (!/^\d+(?:\.0+)?$/.test(input)) return null;
+
+  const serial = Number(input);
+
+  if (serial < 36526 || serial > 73050) return null;
+
+  const date = new Date(
+    Math.round((serial - 25569) * 86400 * 1000),
   );
+
+  if (Number.isNaN(date.getTime())) return null;
+
+  return `${pad2(String(date.getUTCDate()))}/${pad2(
+    String(date.getUTCMonth() + 1),
+  )}/${date.getUTCFullYear()}`;
 }
 
-function rowText(
-  row: Row,
-): string {
-  return normalizeText(
-    row.join(" "),
-  );
-}
+export function extractDate(input: string): string | null {
+  const text = normalizeText(input);
 
-/* ========================================================================== *
- * DATE
- * ========================================================================== */
+  if (!text) return null;
 
-const MONTHS:
-  Record<string, string> = {
-    jan: "01",
-    feb: "02",
-    mar: "03",
-    apr: "04",
-    may: "05",
-    jun: "06",
-    jul: "07",
-    aug: "08",
-    sep: "09",
-    oct: "10",
-    nov: "11",
-    dec: "12",
-  };
+  const excel = excelSerialToDate(text);
 
-function pad2(
-  value: string,
-): string {
-  return value.padStart(
-    2,
-    "0",
-  );
-}
+  if (excel) return excel;
 
-function normalizeYear(
-  value: string,
-): string {
-  if (
-    value.length === 4
-  ) {
-    return value;
+  let m = /\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b/.exec(text);
+
+  if (m) {
+    return `${pad2(m[1] ?? "")}/${pad2(m[2] ?? "")}/${m[3] ?? ""}`;
   }
 
-  return Number(value) >= 70
-    ? `19${value}`
-    : `20${value}`;
-}
+  m = /\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/.exec(text);
 
-/**
- * Excel serial date support.
- */
-export function excelSerialToDate(
-  value: string,
-): string | null {
-  const input =
-    value.trim();
-
-  if (
-    !/^\d+(?:\.0+)?$/.test(
-      input,
-    )
-  ) {
-    return null;
+  if (m) {
+    return `${pad2(m[3] ?? "")}/${pad2(m[2] ?? "")}/${m[1] ?? ""}`;
   }
 
-  const serial =
-    Number(input);
+  m = /\b(\d{1,2})[-/\s]([A-Za-z]{3,9})[-/\s](\d{2,4})\b/.exec(text);
 
-  if (
-    serial < 36526 ||
-    serial > 73050
-  ) {
-    return null;
-  }
-
-  const milliseconds =
-    Math.round(
-      (serial - 25569) *
-        86400 *
-        1000,
-    );
-
-  const date =
-    new Date(
-      milliseconds,
-    );
-
-  if (
-    Number.isNaN(
-      date.getTime(),
-    )
-  ) {
-    return null;
-  }
-
-  return [
-    pad2(
-      String(
-        date.getUTCDate(),
-      ),
-    ),
-    pad2(
-      String(
-        date.getUTCMonth() + 1,
-      ),
-    ),
-    String(
-      date.getUTCFullYear(),
-    ),
-  ].join("/");
-}
-
-/**
- * Returns DD/MM/YYYY.
- */
-export function extractDate(
-  input: string,
-): string | null {
-  const text =
-    normalizeText(
-      input,
-    );
-
-  if (!text) {
-    return null;
-  }
-
-  const excel =
-    excelSerialToDate(
-      text,
-    );
-
-  if (excel) {
-    return excel;
-  }
-
-  let match:
-    RegExpExecArray | null;
-
-  // DD/MM/YYYY
-  match =
-    /\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b/.exec(
-      text,
-    );
-
-  if (match) {
-    return [
-      pad2(match[1] ?? ""),
-      pad2(match[2] ?? ""),
-      match[3] ?? "",
-    ].join("/");
-  }
-
-  // YYYY/MM/DD
-  match =
-    /\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/.exec(
-      text,
-    );
-
-  if (match) {
-    return [
-      pad2(match[3] ?? ""),
-      pad2(match[2] ?? ""),
-      match[1] ?? "",
-    ].join("/");
-  }
-
-  // DD-MMM-YYYY
-  match =
-    /\b(\d{1,2})[-/\s]([A-Za-z]{3,9})[-/\s](\d{2,4})\b/.exec(
-      text,
-    );
-
-  if (match) {
+  if (m) {
     const month =
-      MONTHS[
-        (match[2] ?? "")
-          .slice(0, 3)
-          .toLowerCase()
-      ];
+      MONTHS[(m[2] ?? "").slice(0, 3).toLowerCase()];
 
     if (month) {
-      return [
-        pad2(match[1] ?? ""),
-        month,
-        normalizeYear(
-          match[3] ?? "",
-        ),
-      ].join("/");
+      return `${pad2(m[1] ?? "")}/${month}/${normalizeYear(
+        m[3] ?? "",
+      )}`;
     }
   }
 
-  // DD/MM/YY
-  match =
-    /\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})\b/.exec(
-      text,
-    );
+  m = /\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})\b/.exec(text);
 
-  if (match) {
-    return [
-      pad2(match[1] ?? ""),
-      pad2(match[2] ?? ""),
-      normalizeYear(
-        match[3] ?? "",
-      ),
-    ].join("/");
+  if (m) {
+    return `${pad2(m[1] ?? "")}/${pad2(m[2] ?? "")}/${normalizeYear(
+      m[3] ?? "",
+    )}`;
   }
 
   return null;
 }
 
-function dateNumber(
-  input: string,
-): number | null {
-  const normalized =
-    extractDate(
-      input,
-    );
+function dateTimeKey(input: string): number | null {
+  const date = extractDate(input);
 
-  if (!normalized) {
-    return null;
-  }
+  if (!date) return null;
 
-  const parts =
-    normalized.split("/");
+  const [dd, mm, yyyy] = date.split("/").map(Number);
 
-  const day =
-    Number(parts[0]);
+  if (!dd || !mm || !yyyy) return null;
 
-  const month =
-    Number(parts[1]);
+  const tm = /\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b/.exec(input);
 
-  const year =
-    Number(parts[2]);
-
-  if (
-    !day ||
-    !month ||
-    !year
-  ) {
-    return null;
-  }
+  const hh = Number(tm?.[1] ?? 0);
+  const min = Number(tm?.[2] ?? 0);
+  const sec = Number(tm?.[3] ?? 0);
 
   return Date.UTC(
-    year,
-    month - 1,
-    day,
+    yyyy,
+    mm - 1,
+    dd,
+    hh,
+    min,
+    sec,
   );
 }
 
-/* ========================================================================== *
- * MONEY
- * ========================================================================== */
+/* -------------------------------------------------------------------------- *
+ * Money
+ * -------------------------------------------------------------------------- */
 
-export function parseMoney(
-  input: unknown,
-): number | null {
-  const original =
-    normalizeText(
-      input,
-    );
+export function parseMoney(input: unknown): number | null {
+  const original = normalizeText(input);
 
-  if (
-    !original ||
-    original === "-" ||
-    original === "--"
-  ) {
+  if (!original || original === "-" || original === "--") {
+    return null;
+  }
+
+  if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(original)) {
     return null;
   }
 
@@ -420,236 +210,145 @@ export function parseMoney(
     return null;
   }
 
-  if (
-    /^\d{1,2}:\d{2}(?::\d{2})?$/.test(
-      original,
-    )
-  ) {
+  const negativeByBrackets =
+    /^\(.*\)$/.test(original);
+
+  const cleaned = original
+    .replace(/₹/g, "")
+    .replace(/,/g, "")
+    .replace(/\s+/g, "")
+    .replace(/[()]/g, "")
+    .replace(/(?:CR|DR)$/i, "");
+
+  if (!/^[+-]?\d+(?:\.\d{1,2})?$/.test(cleaned)) {
     return null;
   }
 
-  const bracketNegative =
-    /^\(.*\)$/.test(
-      original,
-    );
+  let n = Number(cleaned);
 
-  const cleaned =
-    original
-      .replace(/₹/g, "")
-      .replace(/,/g, "")
-      .replace(/\s+/g, "")
-      .replace(/[()]/g, "")
-      .replace(/(CR|DR)$/i, "");
-
-  if (
-    !/^[+-]?\d+(?:\.\d{1,2})?$/.test(
-      cleaned,
-    )
-  ) {
+  if (!Number.isFinite(n)) {
     return null;
   }
 
-  let value =
-    Number(cleaned);
-
-  if (
-    !Number.isFinite(
-      value,
-    )
-  ) {
-    return null;
+  if (negativeByBrackets) {
+    n = -Math.abs(n);
   }
 
-  if (
-    bracketNegative
-  ) {
-    value =
-      -Math.abs(value);
-  }
-
-  return value;
+  return n;
 }
 
-function extractMoneyTokens(
-  input: string,
-): number[] {
-  let text =
-    normalizeText(
-      input,
-    );
-
-  text =
-    text.replace(
+/**
+ * Extract amount-like tokens while rejecting long pure references.
+ */
+function moneyTokens(input: string): number[] {
+  let text = normalizeText(input)
+    .replace(
       /\b\d{1,4}[-/.]\d{1,2}[-/.]\d{2,4}\b/g,
       " ",
-    );
-
-  text =
-    text.replace(
+    )
+    .replace(
       /\b\d{1,2}:\d{2}(?::\d{2})?\b/g,
       " ",
     );
 
-  text =
-    text.replace(
-      /(?<!\d)\d{7,30}(?!\d)/g,
-      " ",
-    );
+  const out: number[] = [];
 
-  const regex =
-    /(?:₹\s*)?(\(?[+-]?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?\)?|\(?[+-]?\d+(?:\.\d{1,2})?\)?)/g;
+  const re =
+    /(?:₹\s*)?(\(?[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?\)?)/g;
 
-  const results:
-    number[] = [];
+  let m: RegExpExecArray | null;
 
-  let match:
-    RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const raw = m[1] ?? "";
 
-  while (
-    (match = regex.exec(text)) !== null
-  ) {
-    const value =
-      parseMoney(
-        match[1] ?? "",
-      );
+    const plain =
+      raw.replace(/[(),₹+\-]/g, "");
 
+    /*
+     * Long integer without comma/decimal is usually
+     * account number / UTR / RRN, not amount.
+     */
     if (
-      value !== null
+      /^\d{7,}$/.test(plain) &&
+      !raw.includes(",") &&
+      !raw.includes(".")
     ) {
-      results.push(
-        value,
-      );
+      continue;
+    }
+
+    const n = parseMoney(raw);
+
+    if (n !== null) {
+      out.push(n);
     }
   }
 
-  return results;
+  return out;
 }
 
-function parseCompoundMoneyCell(
+function compoundMoney(
   input: string,
 ): {
   first: number | null;
   second: number | null;
 } {
-  const values =
-    extractMoneyTokens(
-      input,
-    );
+  const v = moneyTokens(input);
 
   return {
-    first:
-      values[0] ?? null,
-    second:
-      values[1] ?? null,
+    first: v[0] ?? null,
+    second: v[1] ?? null,
   };
 }
 
-  const results:
-    number[] = [];
+/* -------------------------------------------------------------------------- *
+ * Header / columns
+ * -------------------------------------------------------------------------- */
 
-  let match:
-    RegExpExecArray | null;
-
-  while (
-    (match = regex.exec(text)) !== null
-  ) {
-    const value =
-      parseMoney(
-        match[1] ?? "",
-      );
-
-    if (
-      value !== null
-    ) {
-      results.push(
-        value,
-      );
-    }
-  }
-
-  return results;
-}
-
-function parseCompoundMoneyCell(
-  input: string,
-): {
-  first: number | null;
-  second: number | null;
-} {
-  const values =
-    extractMoneyTokens(
-      input,
-    );
-
-  return {
-    first:
-      values[0] ?? null,
-
-    second:
-      values[1] ?? null,
-  };
-}
-
-/* ========================================================================== *
- * COLUMN DETECTION
- * ========================================================================== */
-
-const SERIAL_HEADER =
-  /^(s\.?\s*no\.?|sr\.?\s*no\.?|serial|sl\.?\s*no\.?)$/i;
-
-const DATE_HEADER =
+const DATE_H =
   /\b(transaction\s*date|tran\.?\s*date|txn\s*date|posting\s*date|post\s*date|date)\b/i;
 
-const VALUE_DATE_HEADER =
+const VALUE_DATE_H =
   /\b(value\s*date|effective\s*date)\b/i;
 
-const NARRATION_HEADER =
+const NARR_H =
   /\b(particulars?|narration|description|remarks?|details?|transaction\s*details?|transaction\s*description|account\s*description)\b/i;
 
-const REFERENCE_HEADER =
-  /\b(chq\s*\/?\s*ref(?:erence)?\s*(?:no)?|cheque\s*\/?\s*reference|cheque\s*no|reference\s*(?:no|number)?|ref\.?\s*no|utr|rrn|transaction\s*id|txn\s*id|instrument\s*id|instrument\s*no|inst\.?\s*no)\b/i;
+const REF_H =
+  /\b(chq\s*\/?\s*ref(?:erence)?\s*(?:no)?|cheque\s*\/?\s*reference|cheque\s*no|reference\s*(?:no|number)?|ref\.?\s*no|utr|rrn|transaction\s*id|txn\s*id|instrument\s*(?:id|no)|inst\.?\s*no)\b/i;
 
-const DEBIT_HEADER =
+const DEBIT_H =
   /\b(debit\s*amount|debit|dr\.?\s*amount|withdrawal|withdrawals|withdraw|withdrawn)\b/i;
 
-const CREDIT_HEADER =
+const CREDIT_H =
   /\b(credit\s*amount|credit|cr\.?\s*amount|deposit|deposits|deposited)\b/i;
 
-const TYPE_HEADER =
+const TYPE_H =
   /\b(debit\s*\/\s*credit|credit\s*\/\s*debit|dr\s*\/\s*cr|cr\s*\/\s*dr|transaction\s*type|txn\s*type|indicator)\b/i;
 
-const BALANCE_HEADER =
+const BAL_H =
   /\b(closing\s*balance|running\s*balance|available\s*balance|balance\s*\(inr\)|balance)\b/i;
 
-const AMOUNT_HEADER =
+const AMOUNT_H =
   /\b(transaction\s*amount|txn\s*amount|amount\s*\(inr\)|amount)\b/i;
 
-const CHANNEL_HEADER =
+const CHANNEL_H =
   /\b(channel|mode|transaction\s*channel)\b/i;
 
-function cleanHeader(
-  input: string,
-): string {
-  return normalizeText(
-    input,
-  )
-    .toLowerCase()
-    .replace(
-      /[.:]+/g,
-      " ",
-    )
-    .replace(
-      /\s+/g,
-      " ",
-    )
-    .trim();
-}
+const SERIAL_H =
+  /^(s\.?\s*no\.?|sr\.?\s*no\.?|serial|sl\.?\s*no\.?)$/i;
 
 export function detectColumns(
   header: Row,
 ): ColumnMap | null {
-  const map:
-    ColumnMap = {};
+  /*
+   * Positional detection only makes sense when
+   * actual multiple cells exist.
+   */
+  if (header.length < 2) {
+    return null;
+  }
+
+  const map: ColumnMap = {};
 
   let evidence = 0;
 
@@ -659,9 +358,9 @@ export function detectColumns(
       index,
     ) => {
       const text =
-        cleanHeader(
-          raw,
-        );
+        normalizeText(raw)
+          .toLowerCase()
+          .replace(/[.:]+/g, " ");
 
       if (
         !text ||
@@ -670,88 +369,49 @@ export function detectColumns(
         return;
       }
 
-      if (
-        SERIAL_HEADER.test(
-          text,
-        )
-      ) {
-        if (
-          map.serial ===
-          undefined
-        ) {
-          map.serial =
-            index;
-        }
-
+      if (SERIAL_H.test(text)) {
+        map.serial ??= index;
         return;
       }
 
-      if (
-        VALUE_DATE_HEADER.test(
-          text,
-        )
-      ) {
+      if (VALUE_DATE_H.test(text)) {
         if (
-          map.valueDate ===
-          undefined
+          map.valueDate === undefined
         ) {
-          map.valueDate =
-            index;
-
+          map.valueDate = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        DATE_HEADER.test(
-          text,
-        )
-      ) {
+      if (DATE_H.test(text)) {
         if (
-          map.date ===
-          undefined
+          map.date === undefined
         ) {
-          map.date =
-            index;
-
+          map.date = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        NARRATION_HEADER.test(
-          text,
-        )
-      ) {
+      if (NARR_H.test(text)) {
         if (
-          map.narration ===
-          undefined
+          map.narration === undefined
         ) {
-          map.narration =
-            index;
-
+          map.narration = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        REFERENCE_HEADER.test(
-          text,
-        )
-      ) {
+      if (REF_H.test(text)) {
         if (
-          map.reference ===
-          undefined
+          map.reference === undefined
         ) {
-          map.reference =
-            index;
-
+          map.reference = index;
           evidence++;
         }
 
@@ -759,140 +419,77 @@ export function detectColumns(
       }
 
       /*
-       * IMPORTANT:
-       * "Balance Dr/Cr" belongs to BALANCE,
+       * Balance Dr/Cr is balance type,
        * not transaction direction.
        */
       if (
-        BALANCE_HEADER.test(
-          text,
-        ) &&
-        /\b(?:dr|cr)\b/i.test(
-          text,
-        )
+        BAL_H.test(text) &&
+        /\b(?:dr|cr)\b/i.test(text)
       ) {
-        if (
-          map.balanceType ===
-          undefined
-        ) {
-          map.balanceType =
-            index;
-        }
-
+        map.balanceType ??= index;
         return;
       }
 
-      if (
-        BALANCE_HEADER.test(
-          text,
-        )
-      ) {
+      if (BAL_H.test(text)) {
         if (
-          map.balance ===
-          undefined
+          map.balance === undefined
         ) {
-          map.balance =
-            index;
-
+          map.balance = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        CHANNEL_HEADER.test(
-          text,
-        )
-      ) {
-        if (
-          map.channel ===
-          undefined
-        ) {
-          map.channel =
-            index;
-        }
-
+      if (CHANNEL_H.test(text)) {
+        map.channel ??= index;
         return;
       }
 
-      /*
-       * Combined Debit/Credit indicator column.
-       */
       if (
-        TYPE_HEADER.test(
-          text,
-        ) ||
+        TYPE_H.test(text) ||
         (
-          DEBIT_HEADER.test(
-            text,
-          ) &&
-          CREDIT_HEADER.test(
-            text,
-          )
+          DEBIT_H.test(text) &&
+          CREDIT_H.test(text)
         )
       ) {
         if (
-          map.type ===
-          undefined
+          map.type === undefined
         ) {
-          map.type =
-            index;
-
+          map.type = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        DEBIT_HEADER.test(
-          text,
-        )
-      ) {
+      if (DEBIT_H.test(text)) {
         if (
-          map.debit ===
-          undefined
+          map.debit === undefined
         ) {
-          map.debit =
-            index;
-
+          map.debit = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        CREDIT_HEADER.test(
-          text,
-        )
-      ) {
+      if (CREDIT_H.test(text)) {
         if (
-          map.credit ===
-          undefined
+          map.credit === undefined
         ) {
-          map.credit =
-            index;
-
+          map.credit = index;
           evidence++;
         }
 
         return;
       }
 
-      if (
-        AMOUNT_HEADER.test(
-          text,
-        )
-      ) {
+      if (AMOUNT_H.test(text)) {
         if (
-          map.amount ===
-          undefined
+          map.amount === undefined
         ) {
-          map.amount =
-            index;
-
+          map.amount = index;
           evidence++;
         }
       }
@@ -907,65 +504,41 @@ export function detectColumns(
 function columnScore(
   map: ColumnMap,
 ): number {
-  let score = 0;
+  let s = 0;
 
-  if (
-    map.date !==
-    undefined
-  ) {
-    score += 5;
+  if (map.date !== undefined) {
+    s += 5;
   }
 
-  if (
-    map.narration !==
-    undefined
-  ) {
-    score += 5;
+  if (map.narration !== undefined) {
+    s += 5;
   }
 
-  if (
-    map.debit !==
-    undefined
-  ) {
-    score += 5;
+  if (map.debit !== undefined) {
+    s += 5;
   }
 
-  if (
-    map.credit !==
-    undefined
-  ) {
-    score += 5;
+  if (map.credit !== undefined) {
+    s += 5;
   }
 
-  if (
-    map.amount !==
-    undefined
-  ) {
-    score += 4;
+  if (map.amount !== undefined) {
+    s += 4;
   }
 
-  if (
-    map.type !==
-    undefined
-  ) {
-    score += 4;
+  if (map.type !== undefined) {
+    s += 4;
   }
 
-  if (
-    map.balance !==
-    undefined
-  ) {
-    score += 3;
+  if (map.balance !== undefined) {
+    s += 3;
   }
 
-  if (
-    map.reference !==
-    undefined
-  ) {
-    score += 2;
+  if (map.reference !== undefined) {
+    s += 2;
   }
 
-  return score;
+  return s;
 }
 
 export function findColumns(
@@ -975,7 +548,7 @@ export function findColumns(
   headerIndex: number;
   headerDepth: number;
 } {
-  const maxRows =
+  const max =
     Math.min(
       rows.length,
       100,
@@ -991,12 +564,12 @@ export function findColumns(
     null;
 
   for (
-    let index = 0;
-    index < maxRows;
-    index++
+    let i = 0;
+    i < max;
+    i++
   ) {
     const first =
-      rows[index] ?? [];
+      rows[i] ?? [];
 
     const candidates:
       Array<{
@@ -1009,15 +582,10 @@ export function findColumns(
         },
       ];
 
-    /*
-     * Support two-row spreadsheet headers.
-     */
-    if (
-      rows[index + 1]
-    ) {
-      const second =
-        rows[index + 1] ?? [];
+    const second =
+      rows[i + 1];
 
+    if (second) {
       const width =
         Math.max(
           first.length,
@@ -1028,16 +596,16 @@ export function findColumns(
         Row = [];
 
       for (
-        let column = 0;
-        column < width;
-        column++
+        let c = 0;
+        c < width;
+        c++
       ) {
-        combined[column] =
+        combined[c] =
           normalizeText(
             `${
-              first[column] ?? ""
+              first[c] ?? ""
             } ${
-              second[column] ?? ""
+              second[c] ?? ""
             }`,
           );
       }
@@ -1076,7 +644,7 @@ export function findColumns(
         best = {
           columns,
           headerIndex:
-            index,
+            i,
           headerDepth:
             candidate.depth,
           score,
@@ -1085,92 +653,62 @@ export function findColumns(
     }
   }
 
-  if (!best) {
-    return {
-      columns: null,
-      headerIndex: -1,
-      headerDepth: 0,
-    };
-  }
+  return best
+    ? {
+        columns:
+          best.columns,
 
-  return {
-    columns:
-      best.columns,
+        headerIndex:
+          best.headerIndex,
 
-    headerIndex:
-      best.headerIndex,
-
-    headerDepth:
-      best.headerDepth,
-  };
+        headerDepth:
+          best.headerDepth,
+      }
+    : {
+        columns: null,
+        headerIndex: -1,
+        headerDepth: 0,
+      };
 }
 
-/* ========================================================================== *
- * IMPLICIT OCR COLUMN DETECTION
- * ========================================================================== */
-
-/**
- * Expected OCR normalized output:
- *
- * Date | Narration | Reference | Debit | Credit | Balance
- */
 function inferOcrColumns(
   rows: Row[],
 ): ColumnMap | null {
   const samples =
-    rows.filter(
-      (
-        row,
-      ) =>
-        row.length >= 6 &&
-        extractDate(
-          row[0] ?? "",
-        ) !== null,
-    );
+    rows
+      .filter(
+        (
+          r,
+        ) =>
+          r.length >= 6 &&
+          extractDate(
+            r[0] ?? "",
+          ) !== null,
+      )
+      .slice(
+        0,
+        10,
+      );
 
-  if (
-    samples.length < 1
-  ) {
+  if (!samples.length) {
     return null;
   }
 
-  const enough =
-    samples.slice(
-      0,
-      10,
-    );
-
-  let moneyRows = 0;
-
-  for (
-    const row of enough
-  ) {
-    const debit =
-      parseMoney(
-        row[3] ?? "",
-      );
-
-    const credit =
-      parseMoney(
-        row[4] ?? "",
-      );
-
-    const balance =
-      parseMoney(
-        row[5] ?? "",
-      );
-
-    if (
-      debit !== null ||
-      credit !== null ||
-      balance !== null
-    ) {
-      moneyRows++;
-    }
-  }
-
   if (
-    moneyRows === 0
+    !samples.some(
+      (
+        r,
+      ) =>
+        parseMoney(
+          r[3] ?? "",
+        ) !== null ||
+        parseMoney(
+          r[4] ?? "",
+        ) !== null ||
+        parseMoney(
+          r[5] ?? "",
+        ) !== null,
+    )
   ) {
     return null;
   }
@@ -1185,11 +723,11 @@ function inferOcrColumns(
   };
 }
 
-/* ========================================================================== *
- * TRANSACTION ROW RECONSTRUCTION
- * ========================================================================== */
+/* -------------------------------------------------------------------------- *
+ * Row reconstruction
+ * -------------------------------------------------------------------------- */
 
-function hasDate(
+function rowHasDate(
   row: Row,
 ): boolean {
   return row.some(
@@ -1202,17 +740,7 @@ function hasDate(
   );
 }
 
-function isHeaderRow(
-  row: Row,
-): boolean {
-  return (
-    detectColumns(
-      row,
-    ) !== null
-  );
-}
-
-function isStandaloneNoise(
+function isNoise(
   row: Row,
 ): boolean {
   const text =
@@ -1220,16 +748,11 @@ function isStandaloneNoise(
       row,
     );
 
-  if (!text) {
-    return true;
-  }
-
   if (
-    hasDate(
-      row,
-    )
+    !text ||
+    rowHasDate(row)
   ) {
-    return false;
+    return !text;
   }
 
   return (
@@ -1251,15 +774,11 @@ function isStandaloneNoise(
   );
 }
 
-/**
- * Reconstruct transactions whose narration/reference
- * continues on following physical rows.
- */
 export function reconstructRows(
   rows: Row[],
   startIndex = 0,
 ): Row[] {
-  const output:
+  const out:
     Row[] = [];
 
   let current:
@@ -1267,25 +786,19 @@ export function reconstructRows(
     null;
 
   for (
-    let index =
+    let i =
       Math.max(
         0,
         startIndex,
       );
-    index < rows.length;
-    index++
+    i < rows.length;
+    i++
   ) {
-    const source =
-      rows[index] ?? [];
-
     const row =
-      source.map(
-        (
-          cell,
-        ) =>
-          normalizeText(
-            cell,
-          ),
+      (
+        rows[i] ?? []
+      ).map(
+        normalizeText,
       );
 
     if (
@@ -1297,27 +810,27 @@ export function reconstructRows(
     }
 
     /*
-     * Ignore repeated headers between PDF pages.
+     * Repeated page/table header.
      */
     if (
-      isHeaderRow(
+      detectColumns(
         row,
       )
     ) {
       if (current) {
-        output.push(
+        out.push(
           current,
         );
-
-        current =
-          null;
       }
+
+      current =
+        null;
 
       continue;
     }
 
     if (
-      isStandaloneNoise(
+      isNoise(
         row,
       )
     ) {
@@ -1325,12 +838,12 @@ export function reconstructRows(
     }
 
     if (
-      hasDate(
+      rowHasDate(
         row,
       )
     ) {
       if (current) {
-        output.push(
+        out.push(
           current,
         );
       }
@@ -1345,41 +858,2133 @@ export function reconstructRows(
       continue;
     }
 
-    /*
-     * Wrapped continuation line.
-     */
-    const width =
-      Math.max(
-        current.length,
-        row.length,
-      );
-
-    for (
-      let column = 0;
-      column < width;
-      column++
+    if (
+      current.length === 1 &&
+      row.length === 1
     ) {
-      const extra =
-        row[column] ?? "";
-
-      if (!extra) {
-        continue;
-      }
-
-      current[column] =
+      current[0] =
         normalizeText(
           `${
-            current[column] ?? ""
-          } ${extra}`,
+            current[0] ?? ""
+          } ${
+            row[0] ?? ""
+          }`,
         );
+    } else {
+      const width =
+        Math.max(
+          current.length,
+          row.length,
+        );
+
+      for (
+        let c = 0;
+        c < width;
+        c++
+      ) {
+        const extra =
+          row[c] ?? "";
+
+        if (extra) {
+          current[c] =
+            normalizeText(
+              `${
+                current[c] ?? ""
+              } ${extra}`,
+            );
+        }
+      }
     }
   }
 
   if (current) {
-    output.push(
+    out.push(
       current,
     );
   }
 
-  return output;
+  return out;
+}
+
+function detectStatementOrder(
+  rows: Row[],
+  columns:
+    ColumnMap | null,
+): StatementOrder {
+  const keys:
+    number[] = [];
+
+  for (
+    const row of rows
+  ) {
+    const source =
+      columns?.date !==
+      undefined
+        ? (
+            row[
+              columns.date
+            ] ?? ""
+          )
+        : rowText(
+            row,
+          );
+
+    const key =
+      dateTimeKey(
+        source,
+      );
+
+    if (
+      key !== null
+    ) {
+      keys.push(
+        key,
+      );
+    }
+  }
+
+  for (
+    let i = 1;
+    i < keys.length;
+    i++
+  ) {
+    const a =
+      keys[i - 1];
+
+    const b =
+      keys[i];
+
+    if (
+      a === undefined ||
+      b === undefined ||
+      a === b
+    ) {
+      continue;
+    }
+
+    return b > a
+      ? "ascending"
+      : "descending";
+  }
+
+  return "unknown";
+}
+
+/* -------------------------------------------------------------------------- *
+ * Direction / mode
+ * -------------------------------------------------------------------------- */
+
+function indicatorDirection(
+  input: string,
+): Direction {
+  const v =
+    normalizeText(
+      input,
+    )
+      .replace(
+        /\./g,
+        "",
+      )
+      .toUpperCase();
+
+  if (
+    /^(CR|C|CREDIT|CREDITED|DEPOSIT)$/.test(
+      v,
+    )
+  ) {
+    return "credit";
+  }
+
+  if (
+    /^(DR|D|DEBIT|DEBITED|WITHDRAW|WITHDRAWAL)$/.test(
+      v,
+    )
+  ) {
+    return "debit";
+  }
+
+  return "unknown";
+}
+
+function flatIndicatorDirection(
+  input: string,
+): Direction {
+  /*
+   * Remove terminal Balance CR/DR first.
+   */
+  const text =
+    normalizeText(
+      input,
+    ).replace(
+      /\s+(?:CR|DR)\s*$/i,
+      "",
+    );
+
+  const matches = [
+    ...text.matchAll(
+      /(?:^|\s|[/|])((?:CR|DR)|CREDIT|DEBIT)(?=\s|[/|]|$)/gi,
+    ),
+  ];
+
+  for (
+    const m of matches
+  ) {
+    const d =
+      indicatorDirection(
+        m[1] ?? "",
+      );
+
+    if (
+      d !== "unknown"
+    ) {
+      return d;
+    }
+  }
+
+  return "unknown";
+}
+
+function narrationDirection(
+  input: string,
+): Direction {
+  const text =
+    compactText(
+      input,
+    );
+
+  if (
+    /(?:^|[/_: -])UPI[/_: -]+CR(?:[/_: -]|$)/i.test(
+      text,
+    )
+  ) {
+    return "credit";
+  }
+
+  if (
+    /(?:^|[/_: -])UPI[/_: -]+DR(?:[/_: -]|$)/i.test(
+      text,
+    )
+  ) {
+    return "debit";
+  }
+
+  if (
+    /\b(?:credited|amount credited|credit received|amount received|deposited)\b/i.test(
+      text,
+    )
+  ) {
+    return "credit";
+  }
+
+  if (
+    /\b(?:debited|amount debited|withdrawn)\b/i.test(
+      text,
+    )
+  ) {
+    return "debit";
+  }
+
+  return "unknown";
+}
+
+export function detectMode(
+  input: string,
+): PaymentMode {
+  const text =
+    compactText(
+      input,
+    );
+
+  if (
+    /\b(?:IBRTGS|ERTGS|RTGS)\b/i.test(
+      text,
+    )
+  ) {
+    return "RTGS";
+  }
+
+  if (
+    /\b(?:IBNEFT|ENEFT|NEFT)\b/i.test(
+      text,
+    )
+  ) {
+    return "NEFT";
+  }
+
+  if (
+    /\bIMPS\b/i.test(
+      text,
+    ) ||
+    /(?:^|[/_: -])P2A(?:[/_: -]|$)/i.test(
+      text,
+    ) ||
+    /\b(?:PSP2A|IMPSP2A)\b/i.test(
+      text,
+    )
+  ) {
+    return "IMPS";
+  }
+
+  if (
+    /\bUPI\b/i.test(
+      text,
+    ) ||
+    /\bBHIM\b/i.test(
+      text,
+    ) ||
+    /\bMPAY\/UPI\b/i.test(
+      text,
+    ) ||
+    /\bTRTR\b/i.test(
+      text,
+    )
+  ) {
+    return "UPI";
+  }
+
+  return "OTHER";
+}
+
+/* -------------------------------------------------------------------------- *
+ * References
+ * -------------------------------------------------------------------------- */
+
+type RefCandidate = {
+  value: string;
+  score: number;
+};
+
+function cleanReference(
+  input: string,
+): string {
+  return normalizeText(
+    input,
+  )
+    .replace(
+      /^[\s:;,.()[\]{}<>|]+/,
+      "",
+    )
+    .replace(
+      /[\s:;,.()[\]{}<>|]+$/,
+      "",
+    )
+    .replace(
+      /^[-_/]+/,
+      "",
+    )
+    .replace(
+      /[-_/]+$/,
+      "",
+    );
+}
+
+function usableReference(
+  input: string,
+): boolean {
+  const value =
+    cleanReference(
+      input,
+    );
+
+  const compact =
+    value.replace(
+      /[-_/]/g,
+      "",
+    );
+
+  if (
+    compact.length < 6 ||
+    compact.length > 50 ||
+    !/\d/.test(compact)
+  ) {
+    return false;
+  }
+
+  /*
+   * IFSC.
+   */
+  if (
+    /^[A-Z]{4}0[A-Z0-9]{6}$/i.test(
+      value,
+    )
+  ) {
+    return false;
+  }
+
+  /*
+   * Indian mobile.
+   */
+  if (
+    /^[6-9]\d{9}$/.test(
+      value,
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    extractDate(
+      value,
+    ) !== null
+  ) {
+    return false;
+  }
+
+  if (
+    /[.,₹]/.test(
+      value,
+    ) &&
+    parseMoney(
+      value,
+    ) !== null
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function addRef(
+  out:
+    RefCandidate[],
+  raw:
+    string | undefined,
+  score: number,
+): void {
+  if (!raw) {
+    return;
+  }
+
+  const value =
+    cleanReference(
+      raw,
+    );
+
+  if (
+    usableReference(
+      value,
+    )
+  ) {
+    out.push({
+      value,
+      score,
+    });
+  }
+}
+
+function regexRefs(
+  text: string,
+  mode: PaymentMode,
+): RefCandidate[] {
+  const out:
+    RefCandidate[] = [];
+
+  const compact =
+    compactText(
+      text,
+    );
+
+  const explicitPatterns:
+    Array<
+      [
+        RegExp,
+        number,
+      ]
+    > = [
+      [
+        /\bX?UTR[\s:/=_-]+([A-Z0-9][A-Z0-9/_-]{5,48})/gi,
+        500,
+      ],
+      [
+        /\bRRN[\s:/=_-]+(\d{10,18})/gi,
+        490,
+      ],
+      [
+        /\bREF(?:ERENCE)?(?:\s*(?:NO|NUMBER))?[\s:/=_-]+([A-Z0-9][A-Z0-9/_-]{5,48})/gi,
+        360,
+      ],
+      [
+        /\b(?:TXN|TRANSACTION)\s*(?:ID|REF(?:ERENCE)?)[\s:/=_-]+([A-Z0-9][A-Z0-9/_-]{5,48})/gi,
+        350,
+      ],
+    ];
+
+  for (
+    const [
+      re,
+      score,
+    ] of explicitPatterns
+  ) {
+    let m:
+      RegExpExecArray | null;
+
+    while (
+      (
+        m =
+          re.exec(
+            text,
+          )
+      ) !== null
+    ) {
+      addRef(
+        out,
+        m[1],
+        score,
+      );
+    }
+  }
+
+  const collect =
+    (
+      re: RegExp,
+      score: number,
+    ) => {
+      let m:
+        RegExpExecArray | null;
+
+      while (
+        (
+          m =
+            re.exec(
+              compact,
+            )
+        ) !== null
+      ) {
+        addRef(
+          out,
+          m[1],
+          score,
+        );
+      }
+    };
+
+  if (
+    mode === "UPI"
+  ) {
+    collect(
+      /\bUPI\/RRN\/?(\d{12})(?!\d)/gi,
+      480,
+    );
+
+    collect(
+      /\bUPI\/(?:CR\/|DR\/)?(\d{12})(?!\d)/gi,
+      470,
+    );
+
+    collect(
+      /\bMPAY\/UPI\/(?:TRTR\/)?(\d{12})(?!\d)/gi,
+      480,
+    );
+
+    collect(
+      /\bTRTR\/(\d{12})(?!\d)/gi,
+      470,
+    );
+  } else if (
+    mode === "IMPS"
+  ) {
+    collect(
+      /\bIMPS\/(?:P2A\/|P2P\/)?(\d{10,18})(?!\d)/gi,
+      460,
+    );
+
+    collect(
+      /\bPS\/?P2A\/?(\d{10,18})(?!\d)/gi,
+      450,
+    );
+
+    collect(
+      /\bPSP2A(\d{10,18})(?!\d)/gi,
+      450,
+    );
+
+    collect(
+      /\bIMPSP2A(\d{10,18})(?!\d)/gi,
+      450,
+    );
+
+    collect(
+      /\bIMPS[_/-]\d{8}[_/-](\d{10,18})(?:[_/-]|$)/gi,
+      440,
+    );
+  } else if (
+    mode === "NEFT"
+  ) {
+    collect(
+      /\b(?:IBNEFT|ENEFT|NEFT)[/:=_-]+([A-Z0-9]{8,40})(?=$|[-/:\s])/gi,
+      450,
+    );
+
+    collect(
+      /\b([A-Z]{4,8}[A-Z0-9]*\d[A-Z0-9]{8,32})\b/gi,
+      360,
+    );
+  } else if (
+    mode === "RTGS"
+  ) {
+    collect(
+      /\b(?:IBRTGS|ERTGS|RTGS)[/:=_-]+([A-Z0-9]{8,40})(?=$|[-/:\s])/gi,
+      450,
+    );
+
+    collect(
+      /\b([A-Z]{4,8}R[A-Z0-9]{8,32})\b/gi,
+      380,
+    );
+
+    collect(
+      /\b([A-Z]{4,8}[A-Z0-9]*\d[A-Z0-9]{8,32})\b/gi,
+      350,
+    );
+  }
+
+  if (
+    mode === "UPI"
+  ) {
+    for (
+      const m of text.matchAll(
+        /(?<!\d)(\d{12})(?!\d)/g,
+      )
+    ) {
+      addRef(
+        out,
+        m[1],
+        190,
+      );
+    }
+  }
+
+  return out;
+}
+
+export function extractReference(
+  row: Row,
+  columns:
+    ColumnMap | null,
+  mode: PaymentMode,
+): string | null {
+  const candidates:
+    RefCandidate[] = [];
+
+  if (
+    columns?.reference !==
+    undefined
+  ) {
+    const cell =
+      row[
+        columns.reference
+      ] ?? "";
+
+    candidates.push(
+      ...regexRefs(
+        cell,
+        mode,
+      ),
+    );
+
+    addRef(
+      candidates,
+      cell,
+      cleanReference(
+        cell,
+      ).length <= 9
+        ? 210
+        : 300,
+    );
+  }
+
+  candidates.push(
+    ...regexRefs(
+      rowText(
+        row,
+      ),
+      mode,
+    ),
+  );
+
+  const best =
+    new Map<
+      string,
+      number
+    >();
+
+  for (
+    const c of candidates
+  ) {
+    const key =
+      c.value.toUpperCase();
+
+    const old =
+      best.get(
+        key,
+      );
+
+    if (
+      old === undefined ||
+      c.score > old
+    ) {
+      best.set(
+        key,
+        c.score,
+      );
+    }
+  }
+
+  return (
+    [...best.entries()]
+      .sort(
+        (
+          a,
+          b,
+        ) =>
+          b[1] - a[1],
+      )[0]?.[0] ??
+    null
+  );
+}
+
+/* -------------------------------------------------------------------------- *
+ * Amount / balance / classification
+ * -------------------------------------------------------------------------- */
+
+function cellMoney(
+  row: Row,
+  index:
+    number | undefined,
+): number | null {
+  return index === undefined
+    ? null
+    : parseMoney(
+        row[index] ?? "",
+      );
+}
+
+function extractBalance(
+  row: Row,
+  columns:
+    ColumnMap | null,
+): number | null {
+  const direct =
+    cellMoney(
+      row,
+      columns?.balance,
+    );
+
+  if (
+    direct !== null
+  ) {
+    return Math.abs(
+      direct,
+    );
+  }
+
+  for (
+    const index of [
+      columns?.debit,
+      columns?.credit,
+      columns?.amount,
+    ]
+  ) {
+    if (
+      index === undefined
+    ) {
+      continue;
+    }
+
+    const c =
+      compoundMoney(
+        row[index] ?? "",
+      );
+
+    if (
+      c.second !== null
+    ) {
+      return Math.abs(
+        c.second,
+      );
+    }
+  }
+
+  if (
+    row.length === 1
+  ) {
+    const vals =
+      moneyTokens(
+        row[0] ?? "",
+      );
+
+    if (
+      vals.length >= 2
+    ) {
+      return Math.abs(
+        vals[
+          vals.length - 1
+        ] ?? 0,
+      );
+    }
+  }
+
+  return null;
+}
+
+function flatAmount(
+  row: Row,
+): number | null {
+  if (
+    row.length !== 1
+  ) {
+    return null;
+  }
+
+  const vals =
+    moneyTokens(
+      row[0] ?? "",
+    );
+
+  return vals.length >= 2
+    ? (
+        vals[
+          vals.length - 2
+        ] ?? null
+      )
+    : (
+        vals[0] ?? null
+      );
+}
+
+function structuredAmount(
+  row: Row,
+  columns:
+    ColumnMap | null,
+): number | null {
+  const direct =
+    cellMoney(
+      row,
+      columns?.amount,
+    );
+
+  if (
+    direct !== null
+  ) {
+    return direct;
+  }
+
+  const candidates:
+    number[] = [];
+
+  row.forEach(
+    (
+      cell,
+      index,
+    ) => {
+      if (
+        index ===
+          columns?.date ||
+        index ===
+          columns?.valueDate ||
+        index ===
+          columns?.reference ||
+        index ===
+          columns?.balance ||
+        index ===
+          columns?.balanceType ||
+        index ===
+          columns?.serial ||
+        index ===
+          columns?.type
+      ) {
+        return;
+      }
+
+      const n =
+        parseMoney(
+          cell,
+        );
+
+      if (
+        n !== null
+      ) {
+        candidates.push(
+          n,
+        );
+      }
+    },
+  );
+
+  return (
+    candidates[0] ??
+    null
+  );
+}
+
+type Facts = {
+  row: Row;
+  rowIndex: number;
+  raw: string;
+  date: string;
+  rawDate: string;
+  narration: string;
+  mode: PaymentMode;
+  reference: string | null;
+  balance: number | null;
+  amountCandidate: number | null;
+};
+
+function classify(
+  f: Facts,
+  columns:
+    ColumnMap | null,
+  comparisonBalance:
+    number | null,
+): {
+  direction: Direction;
+  amount: number | null;
+  reasons: string[];
+} {
+  const reasons:
+    string[] = [];
+
+  const row =
+    f.row;
+
+  /*
+   * 1. Dedicated Debit / Credit columns.
+   */
+  if (
+    columns?.debit !==
+      undefined ||
+    columns?.credit !==
+      undefined
+  ) {
+    const debit =
+      columns.debit ===
+      undefined
+        ? null
+        : compoundMoney(
+            row[
+              columns.debit
+            ] ?? "",
+          ).first;
+
+    const credit =
+      columns.credit ===
+      undefined
+        ? null
+        : compoundMoney(
+            row[
+              columns.credit
+            ] ?? "",
+          ).first;
+
+    if (
+      debit !== null &&
+      Math.abs(
+        debit,
+      ) > 0 &&
+      (
+        credit === null ||
+        Math.abs(
+          credit,
+        ) === 0
+      )
+    ) {
+      return {
+        direction:
+          "debit",
+
+        amount:
+          Math.abs(
+            debit,
+          ),
+
+        reasons: [
+          "dedicated debit column",
+        ],
+      };
+    }
+
+    if (
+      credit !== null &&
+      Math.abs(
+        credit,
+      ) > 0 &&
+      (
+        debit === null ||
+        Math.abs(
+          debit,
+        ) === 0
+      )
+    ) {
+      return {
+        direction:
+          "credit",
+
+        amount:
+          Math.abs(
+            credit,
+          ),
+
+        reasons: [
+          "dedicated credit column",
+        ],
+      };
+    }
+  }
+
+  /*
+   * 2. Explicit transaction DR/CR column.
+   */
+  if (
+    columns?.type !==
+    undefined
+  ) {
+    const d =
+      indicatorDirection(
+        row[
+          columns.type
+        ] ?? "",
+      );
+
+    const amount =
+      structuredAmount(
+        row,
+        columns,
+      );
+
+    if (
+      d !== "unknown" &&
+      amount !== null
+    ) {
+      return {
+        direction:
+          d,
+
+        amount:
+          Math.abs(
+            amount,
+          ),
+
+        reasons: [
+          "explicit transaction DR/CR",
+        ],
+      };
+    }
+  }
+
+  let amount =
+    structuredAmount(
+      row,
+      columns,
+    );
+
+  if (
+    amount === null
+  ) {
+    amount =
+      f.amountCandidate;
+  }
+
+  /*
+   * 3. Standalone DR/CR in flattened/fixed text.
+   */
+  if (
+    amount !== null
+  ) {
+    const d =
+      flatIndicatorDirection(
+        f.raw,
+      );
+
+    if (
+      d !== "unknown"
+    ) {
+      return {
+        direction:
+          d,
+
+        amount:
+          Math.abs(
+            amount,
+          ),
+
+        reasons: [
+          "standalone transaction DR/CR",
+        ],
+      };
+    }
+  }
+
+  /*
+   * 4. Signed negative amount.
+   */
+  if (
+    amount !== null &&
+    amount < 0
+  ) {
+    return {
+      direction:
+        "debit",
+
+      amount:
+        Math.abs(
+          amount,
+        ),
+
+      reasons: [
+        "negative transaction amount",
+      ],
+    };
+  }
+
+  /*
+   * 5. Running balance reconciliation.
+   *
+   * Ascending -> previous balance
+   * Descending -> next balance
+   */
+  if (
+    amount !== null &&
+    f.balance !== null &&
+    comparisonBalance !==
+      null
+  ) {
+    const delta =
+      Number(
+        (
+          f.balance -
+          comparisonBalance
+        ).toFixed(
+          2,
+        ),
+      );
+
+    const diff =
+      Math.abs(
+        Math.abs(
+          delta,
+        ) -
+          Math.abs(
+            amount,
+          ),
+      );
+
+    const tolerance =
+      Math.max(
+        0.02,
+        Math.abs(
+          amount,
+        ) *
+          0.00001,
+      );
+
+    if (
+      Math.abs(
+        delta,
+      ) > 0 &&
+      diff <= tolerance
+    ) {
+      return {
+        direction:
+          delta > 0
+            ? "credit"
+            : "debit",
+
+        amount:
+          Math.abs(
+            amount,
+          ),
+
+        reasons: [
+          "running balance reconciliation",
+        ],
+      };
+    }
+  }
+
+  /*
+   * 6. Strong narration marker.
+   */
+  if (
+    amount !== null
+  ) {
+    const d =
+      narrationDirection(
+        f.narration,
+      );
+
+    if (
+      d !== "unknown"
+    ) {
+      return {
+        direction:
+          d,
+
+        amount:
+          Math.abs(
+            amount,
+          ),
+
+        reasons: [
+          "strong narration direction marker",
+        ],
+      };
+    }
+  }
+
+  return {
+    direction:
+      "unknown",
+
+    amount:
+      amount === null
+        ? null
+        : Math.abs(
+            amount,
+          ),
+
+    reasons,
+  };
+}
+
+/* -------------------------------------------------------------------------- *
+ * Summary / confidence
+ * -------------------------------------------------------------------------- */
+
+function summaryNumber(
+  text: string,
+  re: RegExp,
+): number | undefined {
+  const raw =
+    re.exec(
+      text,
+    )?.[1];
+
+  if (!raw) {
+    return undefined;
+  }
+
+  const n =
+    Number(
+      raw.replace(
+        /,/g,
+        "",
+      ),
+    );
+
+  return Number.isFinite(
+    n,
+  )
+    ? n
+    : undefined;
+}
+
+export function extractStatementSummary(
+  rows: Row[],
+): StatementSummary | null {
+  const text =
+    rows
+      .map(
+        rowText,
+      )
+      .join(
+        "\n",
+      );
+
+  const s:
+    StatementSummary = {};
+
+  const put =
+    <
+      K extends keyof StatementSummary,
+    >(
+      key: K,
+      value:
+        | StatementSummary[K]
+        | undefined,
+    ) => {
+      if (
+        value !== undefined
+      ) {
+        s[key] =
+          value;
+      }
+    };
+
+  put(
+    "transactionCount",
+    summaryNumber(
+      text,
+      /total\s+transaction\s+count\s*[:=-]?\s*(\d+)/i,
+    ),
+  );
+
+  put(
+    "debitCount",
+    summaryNumber(
+      text,
+      /total\s+debit\s+count\s*[:=-]?\s*(\d+)/i,
+    ),
+  );
+
+  put(
+    "creditCount",
+    summaryNumber(
+      text,
+      /total\s+credit\s+count\s*[:=-]?\s*(\d+)/i,
+    ),
+  );
+
+  put(
+    "debitAmount",
+    summaryNumber(
+      text,
+      /total\s+debit\s+amount\s*[:=-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)/i,
+    ),
+  );
+
+  put(
+    "creditAmount",
+    summaryNumber(
+      text,
+      /total\s+credit\s+amount\s*[:=-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)/i,
+    ),
+  );
+
+  put(
+    "openingBalance",
+    summaryNumber(
+      text,
+      /opening\s+balance\s*[:=-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)/i,
+    ),
+  );
+
+  put(
+    "closingBalance",
+    summaryNumber(
+      text,
+      /closing\s+balance\s*[:=-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)/i,
+    ),
+  );
+
+  return Object.keys(
+    s,
+  ).length
+    ? s
+    : null;
+}
+
+function confidenceFor(
+  tx:
+    Omit<
+      CoreTransaction,
+      | "confidence"
+      | "raw"
+      | "rawDate"
+      | "rowIndex"
+    >,
+): Confidence {
+  let score = 0;
+
+  if (tx.date) {
+    score += 2;
+  }
+
+  if (
+    tx.amount !== null
+  ) {
+    score += 3;
+  }
+
+  if (
+    tx.direction !==
+    "unknown"
+  ) {
+    score += 4;
+  }
+
+  if (
+    tx.mode !== "OTHER"
+  ) {
+    score += 2;
+  }
+
+  if (
+    tx.reference
+  ) {
+    score += 2;
+  }
+
+  if (
+    tx.reasons.some(
+      (
+        r,
+      ) =>
+        /dedicated|explicit|reconciliation|standalone/i.test(
+          r,
+        ),
+    )
+  ) {
+    score += 2;
+  }
+
+  return score >= 11
+    ? "high"
+    : score >= 7
+      ? "medium"
+      : "low";
+}
+
+/* -------------------------------------------------------------------------- *
+ * Main parser
+ * -------------------------------------------------------------------------- */
+
+export function parseStatementRows(
+  inputRows: Row[],
+  inheritedColumns:
+    ColumnMap | null =
+    null,
+): CoreResult {
+  const found =
+    findColumns(
+      inputRows,
+    );
+
+  const columns =
+    found.columns ??
+    inferOcrColumns(
+      inputRows,
+    ) ??
+    inheritedColumns;
+
+  const start =
+    found.headerIndex >= 0
+      ? found.headerIndex +
+        Math.max(
+          1,
+          found.headerDepth,
+        )
+      : 0;
+
+  const rebuilt =
+    reconstructRows(
+      inputRows,
+      start,
+    );
+
+  const order =
+    detectStatementOrder(
+      rebuilt,
+      columns,
+    );
+
+  const facts:
+    Facts[] = [];
+
+  for (
+    let i = 0;
+    i < rebuilt.length;
+    i++
+  ) {
+    const row =
+      rebuilt[i] ?? [];
+
+    const raw =
+      rowText(
+        row,
+      );
+
+    const rawDate =
+      columns?.date !==
+      undefined
+        ? normalizeText(
+            row[
+              columns.date
+            ] ?? "",
+          )
+        : "";
+
+    const date =
+      extractDate(
+        rawDate,
+      ) ??
+      row
+        .map(
+          extractDate,
+        )
+        .find(
+          (
+            v,
+          ): v is string =>
+            v !== null,
+        ) ??
+      extractDate(
+        raw,
+      );
+
+    if (!date) {
+      continue;
+    }
+
+    const narration =
+      columns?.narration !==
+        undefined &&
+      normalizeText(
+        row[
+          columns.narration
+        ] ?? "",
+      )
+        ? normalizeText(
+            row[
+              columns.narration
+            ] ?? "",
+          )
+        : raw;
+
+    let mode =
+      detectMode(
+        narration,
+      );
+
+    if (
+      mode === "OTHER"
+    ) {
+      mode =
+        detectMode(
+          raw,
+        );
+    }
+
+    facts.push({
+      row,
+      rowIndex: i,
+      raw,
+      date,
+      rawDate:
+        rawDate || date,
+      narration,
+      mode,
+
+      reference:
+        extractReference(
+          row,
+          columns,
+          mode,
+        ),
+
+      balance:
+        extractBalance(
+          row,
+          columns,
+        ),
+
+      amountCandidate:
+        row.length === 1
+          ? flatAmount(
+              row,
+            )
+          : structuredAmount(
+              row,
+              columns,
+            ),
+    });
+  }
+
+  const transactions:
+    CoreTransaction[] = [];
+
+  for (
+    let i = 0;
+    i < facts.length;
+    i++
+  ) {
+    const f =
+      facts[i];
+
+    if (!f) {
+      continue;
+    }
+
+    let comparisonBalance:
+      number | null =
+      null;
+
+    if (
+      order ===
+      "ascending"
+    ) {
+      comparisonBalance =
+        facts[
+          i - 1
+        ]?.balance ??
+        null;
+    } else if (
+      order ===
+      "descending"
+    ) {
+      comparisonBalance =
+        facts[
+          i + 1
+        ]?.balance ??
+        null;
+    }
+
+    const c =
+      classify(
+        f,
+        columns,
+        comparisonBalance,
+      );
+
+    const partial = {
+      date:
+        f.date,
+
+      narration:
+        f.narration,
+
+      reference:
+        f.reference,
+
+      amount:
+        c.amount,
+
+      direction:
+        c.direction,
+
+      mode:
+        f.mode,
+
+      balance:
+        f.balance,
+
+      reasons:
+        c.reasons,
+    };
+
+    transactions.push({
+      date:
+        f.date,
+
+      rawDate:
+        f.rawDate,
+
+      narration:
+        f.narration,
+
+      reference:
+        f.reference,
+
+      amount:
+        c.amount,
+
+      direction:
+        c.direction,
+
+      mode:
+        f.mode,
+
+      balance:
+        f.balance,
+
+      confidence:
+        confidenceFor(
+          partial,
+        ),
+
+      raw:
+        f.raw,
+
+      rowIndex:
+        f.rowIndex,
+
+      reasons:
+        c.reasons,
+    });
+  }
+
+  const warnings:
+    string[] = [];
+
+  const summary =
+    extractStatementSummary(
+      inputRows,
+    );
+
+  if (summary) {
+    const debits =
+      transactions.filter(
+        (
+          t,
+        ) =>
+          t.direction ===
+            "debit" &&
+          t.amount !==
+            null,
+      );
+
+    const credits =
+      transactions.filter(
+        (
+          t,
+        ) =>
+          t.direction ===
+            "credit" &&
+          t.amount !==
+            null,
+      );
+
+    const debitTotal =
+      debits.reduce(
+        (
+          s,
+          t,
+        ) =>
+          s +
+          (
+            t.amount ??
+            0
+          ),
+        0,
+      );
+
+    const creditTotal =
+      credits.reduce(
+        (
+          s,
+          t,
+        ) =>
+          s +
+          (
+            t.amount ??
+            0
+          ),
+        0,
+      );
+
+    if (
+      summary.debitCount !==
+        undefined &&
+      summary.debitCount !==
+        debits.length
+    ) {
+      warnings.push(
+        `Debit count mismatch: official=${summary.debitCount}, extracted=${debits.length}`,
+      );
+    }
+
+    if (
+      summary.creditCount !==
+        undefined &&
+      summary.creditCount !==
+        credits.length
+    ) {
+      warnings.push(
+        `Credit count mismatch: official=${summary.creditCount}, extracted=${credits.length}`,
+      );
+    }
+
+    if (
+      summary.debitAmount !==
+        undefined &&
+      Math.abs(
+        summary.debitAmount -
+          debitTotal,
+      ) > 0.02
+    ) {
+      warnings.push(
+        `Debit amount mismatch: official=${summary.debitAmount.toFixed(
+          2,
+        )}, extracted=${debitTotal.toFixed(
+          2,
+        )}`,
+      );
+    }
+
+    if (
+      summary.creditAmount !==
+        undefined &&
+      Math.abs(
+        summary.creditAmount -
+          creditTotal,
+      ) > 0.02
+    ) {
+      warnings.push(
+        `Credit amount mismatch: official=${summary.creditAmount.toFixed(
+          2,
+        )}, extracted=${creditTotal.toFixed(
+          2,
+        )}`,
+      );
+    }
+  }
+
+  return {
+    transactions,
+    columns,
+    summary,
+    warnings,
+  };
+}
+
+/* -------------------------------------------------------------------------- *
+ * Text adapters
+ * -------------------------------------------------------------------------- */
+
+export function textToRows(
+  input: string,
+): Row[] {
+  return String(
+    input ?? "",
+  )
+    .replace(
+      /\r\n?/g,
+      "\n",
+    )
+    .split(
+      "\n",
+    )
+    .map(
+      (
+        raw,
+      ) => {
+        const line =
+          raw.trim();
+
+        if (!line) {
+          return [];
+        }
+
+        /*
+         * Structured OCR.
+         */
+        if (
+          (
+            line.match(
+              /\|/g,
+            ) ?? []
+          ).length >= 4
+        ) {
+          return line
+            .split(
+              "|",
+            )
+            .map(
+              normalizeText,
+            );
+        }
+
+        /*
+         * Tab-separated TXT.
+         */
+        if (
+          line.includes(
+            "\t",
+          )
+        ) {
+          return line
+            .split(
+              "\t",
+            )
+            .map(
+              normalizeText,
+            );
+        }
+
+        /*
+         * Fixed-width bank export.
+         */
+        const fixed =
+          line
+            .split(
+              /\s{2,}/,
+            )
+            .map(
+              normalizeText,
+            )
+            .filter(
+              Boolean,
+            );
+
+        return fixed.length >= 3
+          ? fixed
+          : [
+              normalizeText(
+                line,
+              ),
+            ];
+      },
+    )
+    .filter(
+      (
+        row,
+      ) =>
+        row.some(
+          Boolean,
+        ),
+    );
+}
+
+export function parseStatementText(
+  text: string,
+): CoreResult {
+  return parseStatementRows(
+    textToRows(
+      text,
+    ),
+  );
+}
+
+/* -------------------------------------------------------------------------- *
+ * Merge / dedupe
+ * -------------------------------------------------------------------------- */
+
+function transactionKey(
+  tx: CoreTransaction,
+): string {
+  if (
+    tx.reference
+  ) {
+    return [
+      "REF",
+      tx.reference,
+      tx.direction,
+      tx.mode,
+      tx.amount?.toFixed(
+        2,
+      ) ?? "",
+    ]
+      .join("|")
+      .toUpperCase();
+  }
+
+  return [
+    "NOREF",
+    tx.date,
+    tx.direction,
+    tx.mode,
+    tx.amount?.toFixed(
+      2,
+    ) ?? "",
+    tx.raw.slice(
+      0,
+      100,
+    ),
+  ]
+    .join("|")
+    .toUpperCase();
+}
+
+function quality(
+  tx: CoreTransaction,
+): number {
+  let s = 0;
+
+  if (tx.reference) {
+    s += 5;
+  }
+
+  if (
+    tx.amount !== null
+  ) {
+    s += 5;
+  }
+
+  if (
+    tx.direction !==
+    "unknown"
+  ) {
+    s += 5;
+  }
+
+  if (
+    tx.mode !== "OTHER"
+  ) {
+    s += 3;
+  }
+
+  if (
+    tx.balance !== null
+  ) {
+    s += 2;
+  }
+
+  if (
+    tx.confidence ===
+    "high"
+  ) {
+    s += 3;
+  } else if (
+    tx.confidence ===
+    "medium"
+  ) {
+    s += 1;
+  }
+
+  return s;
+}
+
+export function mergeCoreResults(
+  results:
+    CoreResult[],
+): CoreResult {
+  const map =
+    new Map<
+      string,
+      CoreTransaction
+    >();
+
+  const warningSet =
+    new Set<string>();
+
+  let columns:
+    ColumnMap | null =
+    null;
+
+  let summary:
+    StatementSummary | null =
+    null;
+
+  for (
+    const result of
+      results
+  ) {
+    if (
+      columns === null &&
+      result.columns !==
+        null
+    ) {
+      columns =
+        result.columns;
+    }
+
+    if (
+      summary === null &&
+      result.summary !==
+        null
+    ) {
+      summary =
+        result.summary;
+    }
+
+    result.warnings.forEach(
+      (
+        w,
+      ) =>
+        warningSet.add(
+          w,
+        ),
+    );
+
+    for (
+      const tx of
+        result.transactions
+    ) {
+      const key =
+        transactionKey(
+          tx,
+        );
+
+      const old =
+        map.get(
+          key,
+        );
+
+      if (
+        !old ||
+        quality(
+          tx,
+        ) >
+          quality(
+            old,
+          )
+      ) {
+        map.set(
+          key,
+          tx,
+        );
+      }
+    }
+  }
+
+  return {
+    transactions:
+      [...map.values()],
+
+    columns,
+
+    summary,
+
+    warnings:
+      [...warningSet],
+  };
+}
+
+/* -------------------------------------------------------------------------- *
+ * Filters
+ * -------------------------------------------------------------------------- */
+
+export function isUpiCredit(
+  tx: CoreTransaction,
+): boolean {
+  return (
+    tx.direction ===
+      "credit" &&
+    tx.mode ===
+      "UPI" &&
+    tx.amount !==
+      null
+  );
+}
+
+export function isAnyDebit(
+  tx: CoreTransaction,
+): boolean {
+  return (
+    tx.direction ===
+      "debit" &&
+    tx.amount !==
+      null
+  );
+}
+
+export function isPaymentDebit(
+  tx: CoreTransaction,
+): boolean {
+  return (
+    isAnyDebit(
+      tx,
+    ) &&
+    (
+      tx.mode ===
+        "UPI" ||
+      tx.mode ===
+        "IMPS" ||
+      tx.mode ===
+        "NEFT" ||
+      tx.mode ===
+        "RTGS"
+    )
+  );
+}
+
+export function isOtherDebit(
+  tx: CoreTransaction,
+): boolean {
+  return (
+    isAnyDebit(
+      tx,
+    ) &&
+    tx.mode ===
+      "OTHER"
+  );
+}
+
+export function formatAmount(
+  value: number,
+): string {
+  return Math.abs(
+    value,
+  ).toFixed(
+    2,
+  );
 }
