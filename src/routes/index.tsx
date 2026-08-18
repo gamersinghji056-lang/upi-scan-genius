@@ -48,77 +48,121 @@ export const Route = createFileRoute("/")({
       },
 
       {
-        name: "description",
+        name:
+          "description",
 
         content:
-          "Extract UPI credits and UPI, IMPS, NEFT and RTGS debits from Indian bank statement PDF, CSV, XLS, XLSX and TXT files.",
+          "Extract UPI credits and all debit transactions from Indian bank statement PDF, CSV, XLS, XLSX and TXT files.",
       },
 
       {
-        property: "og:title",
+        property:
+          "og:title",
 
         content:
           "Universal Indian Bank Statement Parser",
       },
 
       {
-        property: "og:description",
+        property:
+          "og:description",
 
         content:
           "Extract Credit and Debit transactions with Date, UTR, Amount and Mode.",
       },
 
       {
-        property: "og:type",
-        content: "website",
+        property:
+          "og:type",
+
+        content:
+          "website",
       },
 
       {
-        name: "twitter:card",
-        content: "summary_large_image",
+        name:
+          "twitter:card",
+
+        content:
+          "summary_large_image",
       },
     ],
   }),
 });
 
 function Index() {
-  const [credits, setCredits] =
-    useState<UpiCredit[] | null>(
-      null,
-    );
+  const [
+    credits,
+    setCredits,
+  ] =
+    useState<
+      UpiCredit[] | null
+    >(null);
 
-  const [debits, setDebits] =
-    useState<DebitTxn[] | null>(
-      null,
-    );
+  const [
+    debits,
+    setDebits,
+  ] =
+    useState<
+      DebitTxn[] | null
+    >(null);
 
-  const [tab, setTab] =
+  const [
+    tab,
+    setTab,
+  ] =
     useState<
       "credit" | "debit"
     >("credit");
 
-  const [debug, setDebug] =
-    useState<ExtractDebug | null>(
-      null,
-    );
+  const [
+    debug,
+    setDebug,
+  ] =
+    useState<
+      ExtractDebug | null
+    >(null);
 
-  const [busy, setBusy] =
+  const [
+    busy,
+    setBusy,
+  ] =
     useState(false);
 
-  const [error, setError] =
-    useState<string | null>(
-      null,
+  const [
+    error,
+    setError,
+  ] =
+    useState<
+      string | null
+    >(null);
+
+  /*
+   * Reader warnings are separate from hard errors.
+   *
+   * Example:
+   * OCR could not verify one page but native PDF extraction still worked.
+   */
+  const [
+    warnings,
+    setWarnings,
+  ] =
+    useState<string[]>(
+      [],
     );
 
   const [
     sourceName,
     setSourceName,
   ] =
-    useState<string | null>(
-      null,
-    );
+    useState<
+      string | null
+    >(null);
 
-  const [pasted, setPasted] =
+  const [
+    pasted,
+    setPasted,
+  ] =
     useState("");
 
   const [
@@ -127,10 +171,13 @@ function Index() {
   ] =
     useState(false);
 
-  const [stage, setStage] =
-    useState<string | null>(
-      null,
-    );
+  const [
+    stage,
+    setStage,
+  ] =
+    useState<
+      string | null
+    >(null);
 
   const [
     devMode,
@@ -149,42 +196,73 @@ function Index() {
       null,
     );
 
-  /* -------------------------------------------------------------- *
-   * Developer debug mode
-   * -------------------------------------------------------------- */
+  /* ======================================================================== *
+   * DEVELOPER MODE
+   * ======================================================================== */
 
-  useEffect(() => {
-    const params =
-      new URLSearchParams(
-        window.location.search,
+  useEffect(
+    () => {
+      const params =
+        new URLSearchParams(
+          window.location
+            .search,
+        );
+
+      const debugValue =
+        params.get(
+          "debug",
+        );
+
+      setDevMode(
+        import.meta.env
+          .DEV ||
+          debugValue ===
+            "1" ||
+          debugValue ===
+            "true",
+      );
+    },
+    [],
+  );
+
+  /* ======================================================================== *
+   * RESET
+   * ======================================================================== */
+
+  const clearResults =
+    () => {
+      setCredits(
+        null,
       );
 
-    const debugValue =
-      params.get("debug");
+      setDebits(
+        null,
+      );
 
-    setDevMode(
-      import.meta.env.DEV ||
-        debugValue === "1" ||
-        debugValue === "true",
-    );
-  }, []);
+      setDebug(
+        null,
+      );
 
-  /* -------------------------------------------------------------- *
-   * Reset results
-   * -------------------------------------------------------------- */
+      setSourceName(
+        null,
+      );
 
-  const clearResults = () => {
-    setCredits(null);
-    setDebits(null);
-    setDebug(null);
-    setSourceName(null);
-    setError(null);
-    setTab("credit");
-  };
+      setError(
+        null,
+      );
 
-  /* -------------------------------------------------------------- *
+      setWarnings(
+        [],
+      );
+
+      setTab(
+        "credit",
+      );
+    };
+
+  /* ======================================================================== *
    * FILE EXTRACTION
-   * -------------------------------------------------------------- */
+   * ======================================================================== */
 
   const runFiles =
     useCallback(
@@ -194,15 +272,28 @@ function Index() {
           | File[],
       ) => {
         const list =
-          Array.from(files);
+          Array.from(
+            files,
+          );
 
-        if (!list.length) {
+        if (
+          list.length ===
+          0
+        ) {
           return;
         }
 
-        setBusy(true);
+        setBusy(
+          true,
+        );
 
-        setError(null);
+        setError(
+          null,
+        );
+
+        setWarnings(
+          [],
+        );
 
         setStage(
           "Preparing statement…",
@@ -212,13 +303,17 @@ function Index() {
           const results = [];
 
           for (
-            const file of list
+            const file of
+              list
           ) {
-            results.push(
+            const result =
               await extractFromFile(
                 file,
                 setStage,
-              ),
+              );
+
+            results.push(
+              result,
             );
           }
 
@@ -228,182 +323,244 @@ function Index() {
             );
 
           setCredits(
-            merged.credit.rows,
+            merged.credit
+              .rows,
           );
 
           setDebits(
-            merged.debit.rows,
+            merged.debit
+              .rows,
           );
 
           setDebug(
-            merged.credit.debug,
+            merged.credit
+              .debug,
+          );
+
+          setWarnings(
+            merged.warnings,
           );
 
           setSourceName(
             list
               .map(
-                (file) =>
+                (
+                  file,
+                ) =>
                   file.name,
               )
-              .join(", "),
+              .join(
+                ", ",
+              ),
           );
 
           /*
-           * Prefer Credit initially if available.
-           * Otherwise open Debit automatically.
+           * Prefer Credit when it exists.
+           *
+           * If there is no UPI credit but debit transactions exist,
+           * automatically open Debit.
            */
           if (
-            merged.credit.rows
-              .length === 0 &&
+            merged.credit
+              .rows.length ===
+              0 &&
             merged.debit.rows
-              .length > 0
+              .length >
+              0
           ) {
-            setTab("debit");
+            setTab(
+              "debit",
+            );
           } else {
-            setTab("credit");
+            setTab(
+              "credit",
+            );
           }
-        } catch (err) {
+        } catch (
+          err
+        ) {
           setError(
             err instanceof Error
               ? err.message
               : "Could not read this statement.",
           );
 
-          setCredits(null);
-          setDebits(null);
-          setDebug(null);
+          setCredits(
+            null,
+          );
+
+          setDebits(
+            null,
+          );
+
+          setDebug(
+            null,
+          );
+
+          setWarnings(
+            [],
+          );
         } finally {
-          setBusy(false);
-          setStage(null);
+          setBusy(
+            false,
+          );
+
+          setStage(
+            null,
+          );
         }
       },
       [],
     );
 
-  /* -------------------------------------------------------------- *
+  /* ======================================================================== *
    * TEXT EXTRACTION
-   * -------------------------------------------------------------- */
+   * ======================================================================== */
 
-  const runText = () => {
-    if (
-      !pasted.trim()
-    ) {
-      return;
-    }
+  const runText =
+    () => {
+      if (
+        !pasted.trim()
+      ) {
+        return;
+      }
 
-    setError(null);
-
-    setSourceName(
-      "Pasted statement text",
-    );
-
-    const creditResult =
-      parseTextDetailed(
-        pasted,
+      setError(
+        null,
       );
 
-    const debitResult =
-      parseDebitsFromText(
-        pasted,
+      /*
+       * Pasted text does not go through PDF OCR,
+       * so reader-level OCR warnings must be cleared.
+       */
+      setWarnings(
+        [],
       );
 
-    setCredits(
-      creditResult.rows,
-    );
+      setSourceName(
+        "Pasted statement text",
+      );
 
-    setDebits(
-      debitResult.rows,
-    );
+      const creditResult =
+        parseTextDetailed(
+          pasted,
+        );
 
-    setDebug(
-      creditResult.debug,
-    );
+      const debitResult =
+        parseDebitsFromText(
+          pasted,
+        );
 
-    if (
-      creditResult.rows
-        .length === 0 &&
-      debitResult.rows
-        .length > 0
-    ) {
-      setTab("debit");
-    } else {
-      setTab("credit");
-    }
-  };
+      setCredits(
+        creditResult.rows,
+      );
 
-  /* -------------------------------------------------------------- *
+      setDebits(
+        debitResult.rows,
+      );
+
+      setDebug(
+        creditResult.debug,
+      );
+
+      if (
+        creditResult.rows
+          .length ===
+          0 &&
+        debitResult.rows
+          .length >
+          0
+      ) {
+        setTab(
+          "debit",
+        );
+      } else {
+        setTab(
+          "credit",
+        );
+      }
+    };
+
+  /* ======================================================================== *
    * CSV DOWNLOAD
-   * -------------------------------------------------------------- */
+   * ======================================================================== */
 
-  const downloadCsv = () => {
-    const isCredit =
-      tab === "credit";
+  const downloadCsv =
+    () => {
+      const isCredit =
+        tab ===
+        "credit";
 
-    const data =
-      isCredit
-        ? credits
-        : debits;
-
-    if (
-      !data ||
-      !data.length
-    ) {
-      return;
-    }
-
-    const csv =
-      isCredit
-        ? toCsv(
-            data as UpiCredit[],
-          )
-        : toDebitCsv(
-            data as DebitTxn[],
-          );
-
-    const blob =
-      new Blob(
-        [csv],
-        {
-          type:
-            "text/csv;charset=utf-8",
-        },
-      );
-
-    const url =
-      URL.createObjectURL(
-        blob,
-      );
-
-    const anchor =
-      document.createElement(
-        "a",
-      );
-
-    anchor.href = url;
-
-    anchor.download =
-      timestampName(
+      const data =
         isCredit
-          ? "UPI_Credit_Report"
-          : "Debit_Report",
+          ? credits
+          : debits;
+
+      if (
+        !data ||
+        data.length ===
+          0
+      ) {
+        return;
+      }
+
+      const csv =
+        isCredit
+          ? toCsv(
+              data as UpiCredit[],
+            )
+          : toDebitCsv(
+              data as DebitTxn[],
+            );
+
+      const blob =
+        new Blob(
+          [
+            csv,
+          ],
+          {
+            type:
+              "text/csv;charset=utf-8",
+          },
+        );
+
+      const url =
+        URL.createObjectURL(
+          blob,
+        );
+
+      const anchor =
+        document.createElement(
+          "a",
+        );
+
+      anchor.href =
+        url;
+
+      anchor.download =
+        timestampName(
+          isCredit
+            ? "UPI_Credit_Report"
+            : "Debit_Report",
+        );
+
+      document.body
+        .appendChild(
+          anchor,
+        );
+
+      anchor.click();
+
+      anchor.remove();
+
+      URL.revokeObjectURL(
+        url,
       );
+    };
 
-    document.body.appendChild(
-      anchor,
-    );
-
-    anchor.click();
-
-    anchor.remove();
-
-    URL.revokeObjectURL(
-      url,
-    );
-  };
-
-  /* -------------------------------------------------------------- *
+  /* ======================================================================== *
    * SUMMARY
-   * -------------------------------------------------------------- */
+   * ======================================================================== */
 
   const creditTotal =
     credits?.reduce(
@@ -416,7 +573,8 @@ function Index() {
           row.amount,
         ),
       0,
-    ) ?? 0;
+    ) ??
+    0;
 
   const debitTotal =
     debits?.reduce(
@@ -429,7 +587,8 @@ function Index() {
           row.amount,
         ),
       0,
-    ) ?? 0;
+    ) ??
+    0;
 
   const difference =
     Math.abs(
@@ -437,19 +596,20 @@ function Index() {
         debitTotal,
     );
 
-  const money = (
-    value: number,
-  ) =>
-    `₹${value.toLocaleString(
-      "en-IN",
-      {
-        minimumFractionDigits:
-          2,
+  const money =
+    (
+      value: number,
+    ) =>
+      `₹${value.toLocaleString(
+        "en-IN",
+        {
+          minimumFractionDigits:
+            2,
 
-        maximumFractionDigits:
-          2,
-      },
-    )}`;
+          maximumFractionDigits:
+            2,
+        },
+      )}`;
 
   const breakdown =
     debits
@@ -459,17 +619,20 @@ function Index() {
       : [];
 
   const hasResults =
-    credits !== null ||
-    debits !== null;
+    credits !==
+      null ||
+    debits !==
+      null;
 
   const visibleRows =
-    tab === "credit"
+    tab ===
+    "credit"
       ? credits ?? []
       : debits ?? [];
 
-  /* -------------------------------------------------------------- *
+  /* ======================================================================== *
    * UI
-   * -------------------------------------------------------------- */
+   * ======================================================================== */
 
   return (
     <main className="min-h-screen">
@@ -489,17 +652,19 @@ function Index() {
             Upload an Indian
             bank statement and
             automatically extract
-            UPI Credits and UPI,
-            IMPS, NEFT and RTGS
-            Debits with Date,
-            UTR / Reference,
-            Amount and Mode.
+            UPI Credits and all
+            Debit transactions
+            with Date, UTR /
+            Reference, Amount
+            and Mode.
           </p>
         </div>
       </header>
 
       <div className="mx-auto max-w-5xl space-y-6 px-5 py-8 sm:px-8">
-        {/* FILE UPLOAD */}
+        {/* ================================================================ *
+         * FILE UPLOAD
+         * ================================================================ */}
 
         <section
           onDragOver={(
@@ -526,7 +691,8 @@ function Index() {
             );
 
             void runFiles(
-              event.dataTransfer
+              event
+                .dataTransfer
                 .files,
             );
           }}
@@ -548,7 +714,9 @@ function Index() {
           </p>
 
           <input
-            ref={inputRef}
+            ref={
+              inputRef
+            }
             type="file"
             multiple
             accept=".pdf,.csv,.xls,.xlsx,.txt,.text,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff,image/*"
@@ -570,9 +738,13 @@ function Index() {
 
           <Button
             className="mt-4"
-            disabled={busy}
+            disabled={
+              busy
+            }
             onClick={() =>
-              inputRef.current?.click()
+              inputRef
+                .current
+                ?.click()
             }
           >
             {busy ? (
@@ -592,7 +764,9 @@ function Index() {
           </p>
         </section>
 
-        {/* PASTE TEXT */}
+        {/* ================================================================ *
+         * PASTE TEXT
+         * ================================================================ */}
 
         <section className="rounded-xl border bg-card p-5 shadow-card">
           <h2 className="text-sm font-semibold">
@@ -601,7 +775,9 @@ function Index() {
           </h2>
 
           <Textarea
-            value={pasted}
+            value={
+              pasted
+            }
             onChange={(
               event,
             ) =>
@@ -610,7 +786,9 @@ function Index() {
                   .value,
               )
             }
-            rows={6}
+            rows={
+              6
+            }
             placeholder="12/12/2025  UPI/426272626736/CR/RAHUL/HDFC  Cr  324.00  10,450.00"
             className="mt-3 font-mono text-xs"
           />
@@ -631,7 +809,9 @@ function Index() {
               <Button
                 variant="ghost"
                 onClick={() =>
-                  setPasted("")
+                  setPasted(
+                    "",
+                  )
                 }
               >
                 <X className="mr-1 h-4 w-4" />
@@ -653,7 +833,9 @@ function Index() {
           </div>
         </section>
 
-        {/* ERROR */}
+        {/* ================================================================ *
+         * HARD ERROR
+         * ================================================================ */}
 
         {error ? (
           <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
@@ -661,7 +843,52 @@ function Index() {
           </div>
         ) : null}
 
-        {/* SUMMARY */}
+        {/* ================================================================ *
+         * READER WARNINGS
+         *
+         * Warnings are intentionally visible even when results exist.
+         * ================================================================ */}
+
+        {warnings.length >
+        0 ? (
+          <section className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4">
+            <p className="text-sm font-semibold">
+              Statement needs
+              attention
+            </p>
+
+            <p className="mt-1 text-xs text-muted-foreground">
+              Results were
+              extracted, but the
+              reader could not
+              fully verify every
+              part of the
+              statement.
+            </p>
+
+            <div className="mt-3 space-y-2">
+              {warnings.map(
+                (
+                  warning,
+                  index,
+                ) => (
+                  <p
+                    key={`${warning}-${index}`}
+                    className="rounded-lg bg-background/70 px-3 py-2 text-xs"
+                  >
+                    {
+                      warning
+                    }
+                  </p>
+                ),
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {/* ================================================================ *
+         * SUMMARY
+         * ================================================================ */}
 
         {hasResults ? (
           <section className="rounded-xl border bg-card p-5 shadow-card">
@@ -737,7 +964,9 @@ function Index() {
                   : "Credit and Debit are equal"}
             </p>
 
-            {/* DEBIT MODE BREAKDOWN */}
+            {/* ============================================================ *
+             * DEBIT BREAKDOWN
+             * ============================================================ */}
 
             {debits?.length ? (
               <div className="mt-4">
@@ -784,7 +1013,9 @@ function Index() {
               </div>
             ) : null}
 
-            {/* TABS */}
+            {/* ============================================================ *
+             * CREDIT / DEBIT TABS
+             * ============================================================ */}
 
             <div className="mt-5 flex gap-2">
               <Button
@@ -824,7 +1055,9 @@ function Index() {
           </section>
         ) : null}
 
-        {/* RESULT TABLE */}
+        {/* ================================================================ *
+         * RESULT TABLE
+         * ================================================================ */}
 
         {hasResults ? (
           <section className="overflow-hidden rounded-xl border bg-card shadow-card">
@@ -838,7 +1071,11 @@ function Index() {
 
                   {tab ===
                   "credit"
-                    ? `${credits?.length ?? 0} UPI Credit Transaction${
+                    ? `${
+                        credits
+                          ?.length ??
+                        0
+                      } UPI Credit Transaction${
                         (
                           credits
                             ?.length ??
@@ -848,7 +1085,11 @@ function Index() {
                           ? ""
                           : "s"
                       }`
-                    : `${debits?.length ?? 0} Debit Transaction${
+                    : `${
+                        debits
+                          ?.length ??
+                        0
+                      } Debit Transaction${
                         (
                           debits
                             ?.length ??
@@ -878,7 +1119,8 @@ function Index() {
                     downloadCsv
                   }
                   disabled={
-                    visibleRows.length ===
+                    visibleRows
+                      .length ===
                     0
                   }
                 >
@@ -960,14 +1202,16 @@ function Index() {
                   {tab ===
                   "credit"
                     ? "No valid UPI Credit transactions were found."
-                    : "No valid UPI, IMPS, NEFT or RTGS Debit transactions were found."}
+                    : "No valid Debit transactions were found."}
                 </p>
               </div>
             )}
           </section>
         ) : null}
 
-        {/* DEBUG */}
+        {/* ================================================================ *
+         * DEBUG
+         * ================================================================ */}
 
         {devMode &&
         debug ? (
