@@ -19,7 +19,6 @@ import {
   formatAmount,
   isAnyDebit,
   isUpiCredit,
-  mergeCoreResults,
   normalizeText,
   parseStatementRows,
   parseStatementText,
@@ -36,17 +35,6 @@ import {
 export type CombinedResult = {
   credit: ExtractResult;
   debit: DebitResult;
-
-  /*
-   * Reader-level warnings.
-   *
-   * Example:
-   * - OCR failed on some suspicious pages
-   * - official summary mismatch
-   *
-   * Existing UI may ignore this for now,
-   * but next we will display it in index.tsx.
-   */
   warnings: string[];
 };
 
@@ -64,12 +52,7 @@ function toCredit(
   if (
     !isUpiCredit(
       transaction,
-    )
-  ) {
-    return null;
-  }
-
-  if (
+    ) ||
     transaction.amount ===
       null ||
     transaction.amount <=
@@ -102,12 +85,7 @@ function toDebit(
   if (
     !isAnyDebit(
       transaction,
-    )
-  ) {
-    return null;
-  }
-
-  if (
+    ) ||
     transaction.amount ===
       null ||
     transaction.amount <=
@@ -135,7 +113,7 @@ function toDebit(
 }
 
 /* ========================================================================== *
- * PUBLIC ROW DEDUPE
+ * DEDUPE
  * ========================================================================== */
 
 function dedupeCredits(
@@ -151,9 +129,7 @@ function dedupeCredits(
     const row of rows
   ) {
     /*
-     * Missing-reference rows are NOT aggressively deduplicated.
-     *
-     * Same date + same amount can legitimately occur multiple times.
+     * Do not aggressively dedupe transactions without UTR.
      */
     if (
       row.utr ===
@@ -252,8 +228,10 @@ function dedupeDebits(
  * ========================================================================== */
 
 function diagnosticReason(
-  transaction: CoreTransaction,
-  accepted: boolean,
+  transaction:
+    CoreTransaction,
+  accepted:
+    boolean,
 ): string | undefined {
   if (
     accepted
@@ -295,7 +273,8 @@ function diagnosticReason(
 }
 
 function makeDiagnostic(
-  transaction: CoreTransaction,
+  transaction:
+    CoreTransaction,
 ): RowDiagnostic {
   const accepted =
     isUpiCredit(
@@ -352,7 +331,7 @@ function makeDiagnostic(
     );
 
   /*
-   * exactOptionalPropertyTypes-safe.
+   * exactOptionalPropertyTypes safe.
    */
   if (
     reason !==
@@ -366,12 +345,14 @@ function makeDiagnostic(
 }
 
 /* ========================================================================== *
- * CORE -> COMBINED RESULT
+ * CORE RESULT -> UI RESULT
  * ========================================================================== */
 
 function combinedFromCore(
-  core: CoreResult,
-  inputLines = 0,
+  core:
+    CoreResult,
+  inputLines =
+    0,
   extraWarnings:
     string[] = [],
 ): CombinedResult {
@@ -503,13 +484,12 @@ function combinedFromCore(
       otherRows,
     },
 
-    warnings:
-      [
-        ...new Set([
-          ...core.warnings,
-          ...extraWarnings,
-        ]),
-      ],
+    warnings: [
+      ...new Set([
+        ...core.warnings,
+        ...extraWarnings,
+      ]),
+    ],
   };
 }
 
@@ -527,7 +507,8 @@ function emptyCombined(): CombinedResult {
  * ========================================================================== */
 
 export function mergeCombined(
-  list: CombinedResult[],
+  list:
+    CombinedResult[],
 ): CombinedResult {
   if (
     list.length ===
@@ -579,18 +560,6 @@ export function mergeCombined(
         row.mode ===
         "OTHER",
     );
-
-  const warnings =
-    [
-      ...new Set(
-        list.flatMap(
-          (
-            result,
-          ) =>
-            result.warnings,
-        ),
-      ),
-    ];
 
   const columns =
     list.find(
@@ -700,7 +669,16 @@ export function mergeCombined(
       otherRows,
     },
 
-    warnings,
+    warnings: [
+      ...new Set(
+        list.flatMap(
+          (
+            result,
+          ) =>
+            result.warnings,
+        ),
+      ),
+    ],
   };
 }
 
@@ -709,13 +687,15 @@ export function mergeCombined(
  * ========================================================================== */
 
 function fromText(
-  text: string,
+  text:
+    string,
   extraWarnings:
     string[] = [],
 ): CombinedResult {
   const normalized =
     String(
-      text ?? "",
+      text ??
+      "",
     );
 
   const core =
@@ -750,53 +730,481 @@ function fromText(
 }
 
 /* ========================================================================== *
- * PDF.JS
+ * MALFORMED BANK EXPORT REPAIR
+ *
+ * Some bank PDF->XLS/XLSX exports contain:
+ *
+ * Header:
+ * Date | Particulars | Withdrawals | Deposits | Balance
+ *
+ * but actual rows may be:
+ *
+ * Debit row:
+ * Date | Narration | 299923.60 | 2453.35 | EMPTY
+ *
+ * where 2453.35 is actually BALANCE.
+ *
+ * Credit row:
+ * Date | Narration | EMPTY | "6000.00 302376.95" | EMPTY
+ *
+ * where:
+ * 6000.00   = Credit
+ * 302376.95 = Balance
+ *
+ * We repair these rows BEFORE statement-core sees them.
  * ========================================================================== */
 
-async function loadPdfjs() {
-  const pdfjs =
-    await import(
-      "pdfjs-dist"
+function moneyParts(
+  value:
+    unknown,
+): string[] {
+  const text =
+    normalizeText(
+      value,
     );
 
-  const workerSrc =
-    (
-      await import(
-        "pdfjs-dist/build/pdf.worker.min.mjs?url"
+  if (
+    !text
+  ) {
+    return [];
+  }
+
+  return (
+    text.match(
+      /[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?/g,
+    ) ??
+    []
+  );
+}
+
+function strongCreditNarration(
+  text:
+    string,
+): boolean {
+  const normalized =
+    normalizeText(
+      text,
+    );
+
+  return (
+    /(?:^|[/_: -])UPI[/_: -]+CR(?:[/_: -]|$)/i.test(
+      normalized,
+    ) ||
+    /\b(?:credited|credit received|amount received|deposited)\b/i.test(
+      normalized,
+    )
+  );
+}
+
+function repairShiftedAmountBalanceRows(
+  inputRows:
+    Row[],
+  inheritedColumns:
+    ColumnMap | null =
+    null,
+): Row[] {
+  /*
+   * Never mutate original rows.
+   */
+  const rows:
+    Row[] =
+    inputRows.map(
+      (
+        row,
+      ) =>
+        row.map(
+          (
+            cell,
+          ) =>
+            normalizeText(
+              cell,
+            ),
+        ),
+    );
+
+  const detected =
+    findColumns(
+      rows,
+    );
+
+  const columns =
+    detected.columns ??
+    inheritedColumns;
+
+  /*
+   * This repair is only enabled when the statement genuinely
+   * declares Debit + Credit + Balance columns.
+   */
+  if (
+    columns?.debit ===
+      undefined ||
+    columns.credit ===
+      undefined ||
+    columns.balance ===
+      undefined
+  ) {
+    return rows;
+  }
+
+  for (
+    const row of rows
+  ) {
+    const balanceCell =
+      normalizeText(
+        row[
+          columns.balance
+        ] ??
+        "",
+      );
+
+    /*
+     * Correct normal row.
+     * Never touch it.
+     */
+    if (
+      balanceCell
+    ) {
+      continue;
+    }
+
+    const debitCell =
+      normalizeText(
+        row[
+          columns.debit
+        ] ??
+        "",
+      );
+
+    const creditCell =
+      normalizeText(
+        row[
+          columns.credit
+        ] ??
+        "",
+      );
+
+    const debitParts =
+      moneyParts(
+        debitCell,
+      );
+
+    const creditParts =
+      moneyParts(
+        creditCell,
+      );
+
+    const narration =
+      columns.narration ===
+      undefined
+        ? row.join(
+            " ",
+          )
+        : normalizeText(
+            row[
+              columns.narration
+            ] ??
+            "",
+          );
+
+    /*
+     * --------------------------------------------------------------
+     * CASE 1
+     *
+     * Credit + balance have been merged into Deposit/Credit cell.
+     *
+     * Example:
+     *
+     * Credit cell:
+     * "6000.00          302376.95"
+     *
+     * Debit:
+     * empty
+     *
+     * Balance:
+     * empty
+     * --------------------------------------------------------------
+     */
+
+    if (
+      debitParts.length ===
+        0 &&
+      creditParts.length >=
+        2
+    ) {
+      row[
+        columns.credit
+      ] =
+        creditParts[0] ??
+        "";
+
+      row[
+        columns.balance
+      ] =
+        creditParts[
+          creditParts.length -
+          1
+        ] ??
+        "";
+
+      continue;
+    }
+
+    /*
+     * --------------------------------------------------------------
+     * CASE 2
+     *
+     * Debit + balance have been merged into Withdrawal/Debit cell.
+     * --------------------------------------------------------------
+     */
+
+    if (
+      creditParts.length ===
+        0 &&
+      debitParts.length >=
+        2
+    ) {
+      row[
+        columns.debit
+      ] =
+        debitParts[0] ??
+        "";
+
+      row[
+        columns.balance
+      ] =
+        debitParts[
+          debitParts.length -
+          1
+        ] ??
+        "";
+
+      continue;
+    }
+
+    /*
+     * --------------------------------------------------------------
+     * CASE 3
+     *
+     * PDF->XLS export shifted running Balance one column left.
+     *
+     * Header says:
+     *
+     * Debit | Credit | Balance
+     *
+     * Actual debit row:
+     *
+     * 299923.60 | 2453.35 | EMPTY
+     *
+     * Correct interpretation:
+     *
+     * Debit   = 299923.60
+     * Credit  = empty
+     * Balance = 2453.35
+     *
+     * We only do this if narration is NOT explicitly credit.
+     * --------------------------------------------------------------
+     */
+
+    if (
+      debitParts.length ===
+        1 &&
+      creditParts.length ===
+        1 &&
+      !strongCreditNarration(
+        narration,
       )
-    ).default;
+    ) {
+      row[
+        columns.balance
+      ] =
+        creditParts[0] ??
+        "";
 
-  pdfjs.GlobalWorkerOptions.workerSrc =
-    workerSrc;
+      row[
+        columns.credit
+      ] =
+        "";
+    }
+  }
 
-  return pdfjs;
+  return rows;
 }
 
 /* ========================================================================== *
- * PDF VISUAL ROWS
+ * PDF.JS
+ *
+ * Safari/iPhone:
+ *
+ * Prefer legacy PDF.js build.
+ * Fall back to standard build if legacy import is unavailable.
+ * ========================================================================== */
+
+async function loadPdfjs(): Promise<any> {
+  /*
+   * Legacy PDF.js is safer for Safari/WebView environments.
+   */
+  try {
+    const pdfjs =
+      await import(
+        "pdfjs-dist/legacy/build/pdf.mjs"
+      );
+
+    try {
+      const worker =
+        await import(
+          "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url"
+        );
+
+      if (
+        pdfjs.GlobalWorkerOptions &&
+        typeof worker.default ===
+          "string"
+      ) {
+        pdfjs.GlobalWorkerOptions.workerSrc =
+          worker.default;
+      }
+    } catch {
+      /*
+       * Do not crash merely because explicit worker URL import failed.
+       * getDocument() will still produce a readable error if PDF.js
+       * cannot initialize.
+       */
+    }
+
+    return pdfjs;
+  } catch {
+    /*
+     * Standard build fallback.
+     */
+    const pdfjs =
+      await import(
+        "pdfjs-dist"
+      );
+
+    try {
+      const worker =
+        await import(
+          "pdfjs-dist/build/pdf.worker.min.mjs?url"
+        );
+
+      if (
+        pdfjs.GlobalWorkerOptions &&
+        typeof worker.default ===
+          "string"
+      ) {
+        pdfjs.GlobalWorkerOptions.workerSrc =
+          worker.default;
+      }
+    } catch {
+      /*
+       * Keep loading path alive.
+       */
+    }
+
+    return pdfjs;
+  }
+}
+
+/* ========================================================================== *
+ * PDF TEXT TYPES
  * ========================================================================== */
 
 type PdfTextItem = {
   str?: string;
   transform?: number[];
-  width?: number;
-  height?: number;
 };
 
 type PdfPageExtraction = {
-  pageNumber: number;
-  rows: Row[];
-  text: string;
-  characterCount: number;
-  datedRows: number;
-  paymentRows: number;
-  numericRows: number;
-  suspicious: boolean;
+  pageNumber:
+    number;
+
+  rows:
+    Row[];
+
+  text:
+    string;
+
+  characterCount:
+    number;
+
+  datedRows:
+    number;
+
+  paymentRows:
+    number;
+
+  numericRows:
+    number;
+
+  suspicious:
+    boolean;
 };
 
+/* ========================================================================== *
+ * SAFE PDF ITEM CONVERSION
+ *
+ * Do not blindly use "for...of" on PDF.js output.
+ * Some browser/runtime combinations may return array-like structures.
+ * ========================================================================== */
+
+function coercePdfItems(
+  value:
+    unknown,
+): PdfTextItem[] {
+  if (
+    Array.isArray(
+      value,
+    )
+  ) {
+    return value as
+      PdfTextItem[];
+  }
+
+  if (
+    value &&
+    typeof value ===
+      "object"
+  ) {
+    const iterator =
+      (
+        value as {
+          [Symbol.iterator]?:
+            unknown;
+        }
+      )[
+        Symbol.iterator
+      ];
+
+    if (
+      typeof iterator ===
+      "function"
+    ) {
+      try {
+        return Array.from(
+          value as Iterable<PdfTextItem>,
+        );
+      } catch {
+        return [];
+      }
+    }
+  }
+
+  return [];
+}
+
+/* ========================================================================== *
+ * PDF VISUAL ROW EXTRACTION
+ * ========================================================================== */
+
 function groupPdfItems(
-  items: PdfTextItem[],
+  itemsValue:
+    unknown,
 ): Row[] {
+  const items =
+    coercePdfItems(
+      itemsValue,
+    );
+
   const buckets =
     new Map<
       number,
@@ -806,12 +1214,24 @@ function groupPdfItems(
       }>
     >();
 
+  /*
+   * Index loop is deliberate.
+   * Avoids relying on unknown iterable behavior from PDF.js internals.
+   */
   for (
-    const item of items
+    let index = 0;
+    index <
+    items.length;
+    index++
   ) {
+    const item =
+      items[index];
+
     if (
-      !item.str ||
-      !item.transform
+      !item?.str ||
+      !Array.isArray(
+        item.transform,
+      )
     ) {
       continue;
     }
@@ -821,45 +1241,51 @@ function groupPdfItems(
         item.str,
       );
 
-    if (!text) {
+    if (
+      !text
+    ) {
       continue;
     }
 
     const x =
-      item.transform[4] ??
-      0;
+      Number(
+        item.transform[4] ??
+        0,
+      );
 
     const y =
-      item.transform[5] ??
-      0;
+      Number(
+        item.transform[5] ??
+        0,
+      );
 
-    /*
-     * Small Y-coordinate differences can still belong
-     * to the same printed transaction line.
-     */
     const key =
       Math.round(
-        y / 2.5,
+        y /
+        2.5,
       ) *
       2.5;
 
-    const row =
+    const bucket =
       buckets.get(
         key,
-      ) ?? [];
+      ) ??
+      [];
 
-    row.push({
+    bucket.push({
       x,
       text,
     });
 
     buckets.set(
       key,
-      row,
+      bucket,
     );
   }
 
-  return [...buckets.entries()]
+  return Array.from(
+    buckets.entries(),
+  )
     .sort(
       (
         a,
@@ -906,7 +1332,8 @@ function groupPdfItems(
 }
 
 function rowsToText(
-  rows: Row[],
+  rows:
+    Row[],
 ): string {
   return rows
     .map(
@@ -923,7 +1350,7 @@ function rowsToText(
 }
 
 /* ========================================================================== *
- * PDF PAGE QUALITY
+ * PDF QUALITY
  * ========================================================================== */
 
 const DATE_SIGNAL =
@@ -936,8 +1363,10 @@ const MONEY_SIGNAL =
   /(?:₹\s*)?(?:\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+\.\d{1,2})/;
 
 function evaluatePdfPage(
-  pageNumber: number,
-  rows: Row[],
+  pageNumber:
+    number,
+  rows:
+    Row[],
 ): PdfPageExtraction {
   const text =
     rowsToText(
@@ -952,9 +1381,14 @@ function evaluatePdfPage(
       )
       .length;
 
-  let datedRows = 0;
-  let paymentRows = 0;
-  let numericRows = 0;
+  let datedRows =
+    0;
+
+  let paymentRows =
+    0;
+
+  let numericRows =
+    0;
 
   for (
     const row of rows
@@ -990,18 +1424,25 @@ function evaluatePdfPage(
   }
 
   const suspicious =
-    characterCount < 180 ||
+    characterCount <
+      180 ||
     (
-      datedRows >= 2 &&
-      numericRows === 0
+      datedRows >=
+        2 &&
+      numericRows ===
+        0
     ) ||
     (
-      paymentRows >= 2 &&
-      datedRows === 0
+      paymentRows >=
+        2 &&
+      datedRows ===
+        0
     ) ||
     (
-      datedRows >= 3 &&
-      rows.length < 5
+      datedRows >=
+        3 &&
+      rows.length <
+        5
     );
 
   return {
@@ -1016,49 +1457,79 @@ function evaluatePdfPage(
   };
 }
 
+/* ========================================================================== *
+ * PDF PAGE EXTRACTION
+ * ========================================================================== */
+
 async function extractPdfPages(
-  doc: any,
+  doc:
+    any,
 ): Promise<PdfPageExtraction[]> {
   const pages:
     PdfPageExtraction[] = [];
 
+  const pageCount =
+    Number(
+      doc?.numPages ??
+      0,
+    );
+
   for (
-    let pageNumber = 1;
+    let pageNumber =
+      1;
     pageNumber <=
-    doc.numPages;
+    pageCount;
     pageNumber++
   ) {
-    const page =
-      await doc.getPage(
-        pageNumber,
+    try {
+      const page =
+        await doc.getPage(
+          pageNumber,
+        );
+
+      const content =
+        await page.getTextContent();
+
+      const rows =
+        groupPdfItems(
+          content?.items,
+        );
+
+      pages.push(
+        evaluatePdfPage(
+          pageNumber,
+          rows,
+        ),
       );
-
-    const content =
-      await page.getTextContent();
-
-    const rows =
-      groupPdfItems(
-        content.items as PdfTextItem[],
+    } catch {
+      /*
+       * A single broken native text page should not destroy
+       * the complete PDF.
+       *
+       * Empty page will automatically be considered suspicious
+       * and sent through OCR recovery.
+       */
+      pages.push(
+        evaluatePdfPage(
+          pageNumber,
+          [],
+        ),
       );
-
-    pages.push(
-      evaluatePdfPage(
-        pageNumber,
-        rows,
-      ),
-    );
+    }
   }
 
   return pages;
 }
 
 /* ========================================================================== *
- * PDF IMAGE RENDERING
+ * PDF PAGE -> IMAGE
  * ========================================================================== */
 
 async function pageToDataUrl(
-  doc: any,
-  pageNumber: number,
+  doc:
+    any,
+  pageNumber:
+    number,
 ): Promise<string> {
   const page =
     await doc.getPage(
@@ -1067,26 +1538,25 @@ async function pageToDataUrl(
 
   const base =
     page.getViewport({
-      scale: 1,
+      scale:
+        1,
     });
 
   const targetWidth =
     Math.min(
       Math.max(
         base.width *
-          2.2,
+        2.2,
         1600,
       ),
       2400,
     );
 
-  const scale =
-    targetWidth /
-    base.width;
-
   const viewport =
     page.getViewport({
-      scale,
+      scale:
+        targetWidth /
+        base.width,
     });
 
   const canvas =
@@ -1109,7 +1579,9 @@ async function pageToDataUrl(
       "2d",
     );
 
-  if (!context) {
+  if (
+    !context
+  ) {
     throw new Error(
       "Could not render this PDF page.",
     );
@@ -1135,7 +1607,8 @@ async function pageToDataUrl(
  * ========================================================================== */
 
 async function fileToDataUrl(
-  file: File,
+  file:
+    File,
 ): Promise<string> {
   return await new Promise<
     string
@@ -1176,7 +1649,8 @@ async function fileToDataUrl(
  * ========================================================================== */
 
 async function ocrImages(
-  images: string[],
+  images:
+    string[],
 ): Promise<string> {
   if (
     images.length ===
@@ -1194,46 +1668,51 @@ async function ocrImages(
 
   return String(
     result.text ??
-      "",
+    "",
   );
 }
 
 type OcrBatchResult = {
-  texts: string[];
-  failedPages: number[];
+  texts:
+    string[];
+
+  failedPages:
+    number[];
 };
 
-/**
- * OCR in batches of 4.
- *
- * Server maximum is 12 images/request,
- * so 4 stays safely under the server limit.
- */
 async function ocrPdfPages(
-  doc: any,
-  pages: number[],
-  onProgress?: ExtractProgress,
+  doc:
+    any,
+  pages:
+    number[],
+  onProgress?:
+    ExtractProgress,
 ): Promise<OcrBatchResult> {
   const unique =
-    [
-      ...new Set(
+    Array.from(
+      new Set(
         pages,
       ),
-    ]
+    )
       .filter(
         (
           page,
         ) =>
-          page >= 1 &&
+          page >=
+            1 &&
           page <=
-            doc.numPages,
+            Number(
+              doc?.numPages ??
+              0,
+            ),
       )
       .sort(
         (
           a,
           b,
         ) =>
-          a - b,
+          a -
+          b,
       );
 
   const texts:
@@ -1256,13 +1735,13 @@ async function ocrPdfPages(
       unique.slice(
         start,
         start +
-          BATCH_SIZE,
+        BATCH_SIZE,
       );
 
     onProgress?.(
       `Deep reading PDF pages ${start + 1}-${Math.min(
         start +
-          batch.length,
+        batch.length,
         unique.length,
       )} of ${unique.length}…`,
     );
@@ -1278,14 +1757,11 @@ async function ocrPdfPages(
       batch
     ) {
       try {
-        const image =
+        images.push(
           await pageToDataUrl(
             doc,
             pageNumber,
-          );
-
-        images.push(
-          image,
+          ),
         );
 
         renderedPages.push(
@@ -1333,23 +1809,79 @@ async function ocrPdfPages(
     texts,
 
     failedPages:
-      [
-        ...new Set(
+      Array.from(
+        new Set(
           failedPages,
         ),
-      ].sort(
+      ).sort(
         (
           a,
           b,
         ) =>
-          a - b,
+          a -
+          b,
       ),
   };
 }
 
 /* ========================================================================== *
- * PDF OCR DECISION
+ * CORE QUALITY
  * ========================================================================== */
+
+function knownTransactionCount(
+  core:
+    CoreResult,
+): number {
+  return core.transactions
+    .filter(
+      (
+        transaction,
+      ) =>
+        transaction.direction !==
+          "unknown" &&
+        transaction.amount !==
+          null,
+    )
+    .length;
+}
+
+function betterCore(
+  first:
+    CoreResult,
+  second:
+    CoreResult,
+): CoreResult {
+  const firstKnown =
+    knownTransactionCount(
+      first,
+    );
+
+  const secondKnown =
+    knownTransactionCount(
+      second,
+    );
+
+  if (
+    secondKnown >
+    firstKnown
+  ) {
+    return second;
+  }
+
+  if (
+    firstKnown >
+    secondKnown
+  ) {
+    return first;
+  }
+
+  return second.transactions
+    .length >
+    first.transactions
+      .length
+    ? second
+    : first;
+}
 
 function pageNeedsOcr(
   page:
@@ -1363,31 +1895,20 @@ function pageNeedsOcr(
     return true;
   }
 
-  const knownTransactions =
-    pageCore.transactions
-      .filter(
-        (
-          transaction,
-        ) =>
-          transaction.direction !==
-            "unknown" &&
-          transaction.amount !==
-            null,
-      )
-      .length;
+  const known =
+    knownTransactionCount(
+      pageCore,
+    );
 
-  /*
-   * Many visible dated rows but only a small portion became
-   * usable transactions.
-   */
   if (
-    page.datedRows >= 4 &&
-    knownTransactions <
+    page.datedRows >=
+      4 &&
+    known <
       Math.max(
         1,
         Math.floor(
           page.datedRows *
-            0.45,
+          0.45,
         ),
       )
   ) {
@@ -1395,16 +1916,18 @@ function pageNeedsOcr(
   }
 
   if (
-    page.paymentRows >= 3 &&
-    knownTransactions ===
+    page.paymentRows >=
+      3 &&
+    known ===
       0
   ) {
     return true;
   }
 
   if (
-    page.datedRows >= 2 &&
-    knownTransactions ===
+    page.datedRows >=
+      2 &&
+    known ===
       0
   ) {
     return true;
@@ -1414,46 +1937,28 @@ function pageNeedsOcr(
 }
 
 /* ========================================================================== *
- * PDF
- *
- * CRITICAL DESIGN:
- *
- * FINAL native extraction parses ALL PDF rows together.
- *
- * Therefore:
- *
- * page 1 last balance <-> page 2 first transaction
- *
- * and
- *
- * page 2 last balance <-> page 3 first transaction
- *
- * remain in one chronological transaction chain.
- *
- * Page-level parsing below is ONLY used to decide whether OCR is needed.
+ * PDF READER
  * ========================================================================== */
 
 async function readPdf(
-  file: File,
-  onProgress?: ExtractProgress,
+  file:
+    File,
+  onProgress?:
+    ExtractProgress,
 ): Promise<CombinedResult> {
   onProgress?.(
     "Opening PDF…",
   );
 
   let pdfjs:
-    Awaited<
-      ReturnType<
-        typeof loadPdfjs
-      >
-    >;
+    any;
 
   try {
     pdfjs =
       await loadPdfjs();
   } catch {
     throw new Error(
-      "PDF reader could not be loaded.",
+      "PDF reader could not be loaded on this browser.",
     );
   }
 
@@ -1461,11 +1966,23 @@ async function readPdf(
     any;
 
   try {
-    doc =
-      await pdfjs.getDocument({
+    /*
+     * Explicit Uint8Array is safer than handing PDF.js
+     * a browser-specific ArrayBuffer object directly.
+     */
+    const bytes =
+      new Uint8Array(
+        await file.arrayBuffer(),
+      );
+
+    const loadingTask =
+      pdfjs.getDocument({
         data:
-          await file.arrayBuffer(),
-      }).promise;
+          bytes,
+      });
+
+    doc =
+      await loadingTask.promise;
   } catch (
     error
   ) {
@@ -1485,12 +2002,15 @@ async function readPdf(
     }
 
     throw new Error(
-      "Unable to open this PDF. The file may be encrypted, corrupted, or unsupported.",
+      "Unable to open this PDF. The file may be encrypted, corrupted, or unsupported by the browser PDF engine.",
     );
   }
 
   onProgress?.(
-    `Reading ${doc.numPages} PDF page(s)…`,
+    `Reading ${Number(
+      doc?.numPages ??
+      0,
+    )} PDF page(s)…`,
   );
 
   const pages =
@@ -1500,15 +2020,11 @@ async function readPdf(
 
   /*
    * ---------------------------------------------------------------
-   * FINAL NATIVE PARSE
+   * WHOLE-DOCUMENT STRUCTURED PARSE
    * ---------------------------------------------------------------
-   *
-   * Entire PDF is parsed as ONE statement.
-   *
-   * This fixes cross-page running-balance classification.
    */
-  const allNativeRows:
-    Row[] =
+
+  const allRows =
     pages.flatMap(
       (
         page,
@@ -1516,33 +2032,104 @@ async function readPdf(
         page.rows,
     );
 
-  const nativeCore =
+  const detectedColumns =
+    findColumns(
+      allRows,
+    ).columns;
+
+  /*
+   * Repair malformed Withdrawals / Deposits / Balance structure
+   * before statement-core sees it.
+   */
+  const repairedRows =
+    repairShiftedAmountBalanceRows(
+      allRows,
+      detectedColumns,
+    );
+
+  const structuredCore =
     parseStatementRows(
-      allNativeRows,
+      repairedRows,
+      detectedColumns,
     );
 
   /*
    * ---------------------------------------------------------------
-   * PAGE-LEVEL QUALITY CHECK
-   * ---------------------------------------------------------------
+   * WHOLE-DOCUMENT FLAT-TEXT FALLBACK
    *
-   * These page parses are NOT used as final transaction results.
-   * They only decide which pages require OCR.
+   * Some PDFs have usable visual text but their x-position structure
+   * does not map cleanly to table cells.
+   * ---------------------------------------------------------------
    */
+
+  const fullText =
+    pages
+      .map(
+        (
+          page,
+        ) =>
+          page.text,
+      )
+      .filter(
+        Boolean,
+      )
+      .join(
+        "\n",
+      );
+
+  const textCore =
+    fullText.trim()
+      ? parseStatementText(
+          fullText,
+        )
+      : structuredCore;
+
+  /*
+   * Pick the stronger native interpretation.
+   */
+  const nativeCore =
+    betterCore(
+      structuredCore,
+      textCore,
+    );
+
+  /* ---------------------------------------------------------------------- *
+   * PAGE LEVEL QUALITY CHECK
+   * ---------------------------------------------------------------------- */
+
   const ocrPages:
     number[] = [];
 
   let inheritedColumns:
     ColumnMap | null =
-    nativeCore.columns;
+    detectedColumns;
 
   for (
     const page of pages
   ) {
-    const pageCore =
-      parseStatementRows(
+    const repairedPageRows =
+      repairShiftedAmountBalanceRows(
         page.rows,
         inheritedColumns,
+      );
+
+    const structuredPageCore =
+      parseStatementRows(
+        repairedPageRows,
+        inheritedColumns,
+      );
+
+    const textPageCore =
+      page.text.trim()
+        ? parseStatementText(
+            page.text,
+          )
+        : structuredPageCore;
+
+    const pageCore =
+      betterCore(
+        structuredPageCore,
+        textPageCore,
       );
 
     if (
@@ -1565,43 +2152,34 @@ async function readPdf(
     }
   }
 
-  const usableNative =
-    nativeCore.transactions
-      .filter(
-        (
-          transaction,
-        ) =>
-          transaction.direction !==
-            "unknown" &&
-          transaction.amount !==
-            null,
-      )
-      .length;
-
   /*
-   * Nothing usable from native PDF:
+   * No native transactions at all:
    * OCR every page.
    */
   if (
-    usableNative ===
+    knownTransactionCount(
+      nativeCore,
+    ) ===
     0
   ) {
     for (
-      let pageNumber = 1;
-      pageNumber <=
-      doc.numPages;
-      pageNumber++
+      let page = 1;
+      page <=
+      Number(
+        doc?.numPages ??
+        0,
+      );
+      page++
     ) {
       ocrPages.push(
-        pageNumber,
+        page,
       );
     }
   }
 
   /*
-   * Official statement totals/counts disagree with extraction.
-   *
-   * Treat transaction-looking pages as suspicious.
+   * Official summary mismatch:
+   * re-check pages that visibly contain transaction data.
    */
   if (
     nativeCore.warnings
@@ -1625,14 +2203,14 @@ async function readPdf(
   }
 
   const uniqueOcrPages =
-    [
-      ...new Set(
+    Array.from(
+      new Set(
         ocrPages,
       ),
-    ];
+    );
 
   /*
-   * Clean native PDF.
+   * Clean native statement.
    */
   if (
     uniqueOcrPages.length ===
@@ -1640,7 +2218,7 @@ async function readPdf(
   ) {
     return combinedFromCore(
       nativeCore,
-      allNativeRows.length,
+      repairedRows.length,
     );
   }
 
@@ -1656,9 +2234,8 @@ async function readPdf(
     );
 
   /*
-   * OCR was required but completely unavailable.
-   *
-   * Never silently pretend native partial extraction is complete.
+   * If OCR fails but native PDF already gave valid transactions,
+   * DO NOT throw away usable native results.
    */
   if (
     ocrResult.texts.length ===
@@ -1666,46 +2243,55 @@ async function readPdf(
     ocrResult.failedPages.length >
       0
   ) {
+    if (
+      knownTransactionCount(
+        nativeCore,
+      ) >
+      0
+    ) {
+      return combinedFromCore(
+        nativeCore,
+        repairedRows.length,
+        [
+          `OCR could not verify PDF page(s): ${ocrResult.failedPages.join(
+            ", ",
+          )}. Native PDF text was used for the available result.`,
+        ],
+      );
+    }
+
     throw new Error(
-      `The PDF opened, but ${ocrResult.failedPages.length} page(s) required deeper reading and OCR failed. Check OCR configuration or try the statement again.`,
+      `The PDF opened, but ${ocrResult.failedPages.length} page(s) required deeper reading and OCR failed.`,
     );
   }
 
   /*
-   * OCR texts are normalized statement rows.
+   * OCR is recovery.
    *
-   * Each OCR text may contain multiple pages from one batch.
+   * Keep native result unless an OCR interpretation is demonstrably
+   * stronger than it.
    */
-  const ocrCores =
-    ocrResult.texts
-      .filter(
-        (
-          text,
-        ) =>
-          Boolean(
-            text.trim(),
-          ),
-      )
-      .map(
-        (
-          text,
-        ) =>
-          parseStatementText(
-            text,
-          ),
-      );
+  let finalCore =
+    nativeCore;
 
-  /*
-   * Native extraction remains primary.
-   *
-   * OCR adds/replaces higher-quality duplicate transactions through
-   * mergeCoreResults().
-   */
-  const finalCore =
-    mergeCoreResults([
-      nativeCore,
-      ...ocrCores,
-    ]);
+  for (
+    const text of
+    ocrResult.texts
+  ) {
+    if (
+      !text.trim()
+    ) {
+      continue;
+    }
+
+    finalCore =
+      betterCore(
+        finalCore,
+        parseStatementText(
+          text,
+        ),
+      );
+  }
 
   const warnings:
     string[] = [];
@@ -1717,13 +2303,13 @@ async function readPdf(
     warnings.push(
       `OCR could not verify PDF page(s): ${ocrResult.failedPages.join(
         ", ",
-      )}. Results from those page(s) may rely only on the native PDF text layer.`,
+      )}. Results for those pages rely on native PDF text.`,
     );
   }
 
   return combinedFromCore(
     finalCore,
-    allNativeRows.length,
+    repairedRows.length,
     warnings,
   );
 }
@@ -1733,30 +2319,74 @@ async function readPdf(
  * ========================================================================== */
 
 type WorkbookSheet = {
-  name: string;
-  rows: Row[];
+  name:
+    string;
+
+  rows:
+    Row[];
 };
 
+/* ========================================================================== *
+ * EXCEL CELL NORMALIZATION
+ * ========================================================================== */
+
+function excelCellText(
+  value:
+    unknown,
+): string {
+  /*
+   * Defensive support if SheetJS ever gives us a Date object.
+   */
+  if (
+    value instanceof
+      Date &&
+    !Number.isNaN(
+      value.getTime(),
+    )
+  ) {
+    const dd =
+      String(
+        value.getDate(),
+      ).padStart(
+        2,
+        "0",
+      );
+
+    const mm =
+      String(
+        value.getMonth() +
+        1,
+      ).padStart(
+        2,
+        "0",
+      );
+
+    return `${dd}/${mm}/${value.getFullYear()}`;
+  }
+
+  return normalizeText(
+    value,
+  );
+}
+
 async function readWorkbookSheets(
-  file: File,
+  file:
+    File,
 ): Promise<WorkbookSheet[]> {
   const XLSX =
     await import(
       "xlsx"
     );
 
-  const buffer =
-    await file.arrayBuffer();
-
   const workbook =
     XLSX.read(
-      buffer,
+      await file.arrayBuffer(),
       {
         type:
           "array",
 
         /*
-         * Preserve displayed bank statement values.
+         * Keep bank-formatted displayed values.
          */
         raw:
           false,
@@ -1771,54 +2401,53 @@ async function readWorkbookSheets(
 
   for (
     const sheetName of
-      workbook.SheetNames
+    workbook.SheetNames
   ) {
     const sheet =
       workbook.Sheets[
         sheetName
       ];
 
-    if (!sheet) {
+    if (
+      !sheet
+    ) {
       continue;
     }
 
     const data =
-      XLSX.utils
-        .sheet_to_json<
-          unknown[]
-        >(
-          sheet,
-          {
-            header: 1,
-            defval: "",
-            raw: false,
-            blankrows:
-              false,
-          },
-        );
+      XLSX.utils.sheet_to_json(
+        sheet,
+        {
+          header:
+            1,
+
+          defval:
+            "",
+
+          raw:
+            false,
+
+          blankrows:
+            false,
+        },
+      ) as unknown[][];
 
     const rows:
       Row[] =
       data
         .map(
           (
-            rawRow,
+            rawRow:
+              unknown[],
           ) =>
-            (
-              rawRow as unknown[]
-            )
-              .map(
-                (
-                  cell,
-                ) =>
-                  normalizeText(
-                    cell,
-                  ),
-              ),
+            rawRow.map(
+              excelCellText,
+            ),
         )
         .filter(
           (
-            row,
+            row:
+              Row,
           ) =>
             row.some(
               Boolean,
@@ -1842,10 +2471,7 @@ async function readWorkbookSheets(
 }
 
 /* ========================================================================== *
- * COLUMN SIGNATURE
- *
- * Used to know whether Sheet 2 is a continuation of Sheet 1
- * or starts a genuinely different table layout.
+ * WORKBOOK SHEET GROUPING
  * ========================================================================== */
 
 function columnSignature(
@@ -1884,30 +2510,19 @@ function columnSignature(
               value,
             ),
     )
-    .join("|");
+    .join(
+      "|",
+    );
 }
 
 type SheetGroup = {
-  rows: Row[];
-  columns: ColumnMap | null;
+  rows:
+    Row[];
+
+  columns:
+    ColumnMap | null;
 };
 
-/**
- * Group continuation sheets together.
- *
- * Example:
- *
- * Sheet1:
- * Date | Narration | Debit | Credit | Balance
- *
- * Sheet2:
- * transactions continue without another header
- *
- * => parsed together so balance chain survives sheet boundary.
- *
- * If a later sheet has a genuinely different detected table layout,
- * previous group is closed and a new group starts.
- */
 function groupWorkbookSheets(
   sheets:
     WorkbookSheet[],
@@ -1925,31 +2540,32 @@ function groupWorkbookSheets(
   let currentSignature =
     "";
 
-  const flush = () => {
-    if (
-      currentRows.length ===
-      0
-    ) {
-      return;
-    }
+  const flush =
+    () => {
+      if (
+        currentRows.length ===
+        0
+      ) {
+        return;
+      }
 
-    groups.push({
-      rows:
-        currentRows,
+      groups.push({
+        rows:
+          currentRows,
 
-      columns:
-        currentColumns,
-    });
+        columns:
+          currentColumns,
+      });
 
-    currentRows =
-      [];
+      currentRows =
+        [];
 
-    currentColumns =
-      null;
+      currentColumns =
+        null;
 
-    currentSignature =
-      "";
-  };
+      currentSignature =
+        "";
+    };
 
   for (
     const sheet of sheets
@@ -1959,33 +2575,35 @@ function groupWorkbookSheets(
         sheet.rows,
       ).columns;
 
-    const detectedSignature =
+    const signature =
       columnSignature(
         detected,
       );
 
     /*
-     * First sheet/group.
+     * First sheet.
      */
     if (
       currentRows.length ===
       0
     ) {
       currentRows =
-        [...sheet.rows];
+        [
+          ...sheet.rows,
+        ];
 
       currentColumns =
         detected;
 
       currentSignature =
-        detectedSignature;
+        signature;
 
       continue;
     }
 
     /*
-     * No header on this sheet:
-     * treat as continuation of previous sheet.
+     * Sheet without its own header:
+     * continuation of previous statement table.
      */
     if (
       detected ===
@@ -1999,7 +2617,8 @@ function groupWorkbookSheets(
     }
 
     /*
-     * Current group did not have a detected header yet.
+     * Previous sheet had no detectable header,
+     * but this sheet does.
      */
     if (
       currentColumns ===
@@ -2013,19 +2632,17 @@ function groupWorkbookSheets(
         detected;
 
       currentSignature =
-        detectedSignature;
+        signature;
 
       continue;
     }
 
     /*
-     * Same column layout:
-     * continuation of same bank table.
-     *
-     * Parse together for cross-sheet balance continuity.
+     * Same layout:
+     * continue same table and preserve balance chain.
      */
     if (
-      detectedSignature ===
+      signature ===
       currentSignature
     ) {
       currentRows.push(
@@ -2037,18 +2654,20 @@ function groupWorkbookSheets(
 
     /*
      * Different table structure:
-     * safely start a separate parser group.
+     * start separate group.
      */
     flush();
 
     currentRows =
-      [...sheet.rows];
+      [
+        ...sheet.rows,
+      ];
 
     currentColumns =
       detected;
 
     currentSignature =
-      detectedSignature;
+      signature;
   }
 
   flush();
@@ -2057,13 +2676,14 @@ function groupWorkbookSheets(
 }
 
 /* ========================================================================== *
- * SPREADSHEET PARSER
+ * WORKBOOK PARSER
  * ========================================================================== */
 
 function parseWorkbook(
   sheets:
     WorkbookSheet[],
-  onProgress?: ExtractProgress,
+  onProgress?:
+    ExtractProgress,
 ): CombinedResult {
   if (
     sheets.length ===
@@ -2077,10 +2697,8 @@ function parseWorkbook(
       sheets,
     );
 
-  const cores:
-    CoreResult[] = [];
-
-  let inputLines = 0;
+  const combined:
+    CombinedResult[] = [];
 
   for (
     let index = 0;
@@ -2091,7 +2709,9 @@ function parseWorkbook(
     const group =
       groups[index];
 
-    if (!group) {
+    if (
+      !group
+    ) {
       continue;
     }
 
@@ -2099,33 +2719,33 @@ function parseWorkbook(
       `Reading statement table ${index + 1} of ${groups.length}…`,
     );
 
-    inputLines +=
-      group.rows.length;
-
     /*
-     * Entire continuation group is parsed together.
+     * Fix malformed bank export BEFORE parser.
      *
-     * This preserves running-balance direction across sheet boundaries.
+     * Correct normal XLS/XLSX rows are untouched.
      */
-    const core =
-      parseStatementRows(
+    const repairedRows =
+      repairShiftedAmountBalanceRows(
         group.rows,
         group.columns,
       );
 
-    cores.push(
-      core,
+    const core =
+      parseStatementRows(
+        repairedRows,
+        group.columns,
+      );
+
+    combined.push(
+      combinedFromCore(
+        core,
+        repairedRows.length,
+      ),
     );
   }
 
-  const merged =
-    mergeCoreResults(
-      cores,
-    );
-
-  return combinedFromCore(
-    merged,
-    inputLines,
+  return mergeCombined(
+    combined,
   );
 }
 
@@ -2134,8 +2754,10 @@ function parseWorkbook(
  * ========================================================================== */
 
 export async function extractFromFile(
-  file: File,
-  onProgress?: ExtractProgress,
+  file:
+    File,
+  onProgress?:
+    ExtractProgress,
 ): Promise<CombinedResult> {
   const name =
     file.name
@@ -2169,8 +2791,8 @@ export async function extractFromFile(
         file,
       );
 
-    let text:
-      string;
+    let text =
+      "";
 
     try {
       text =
@@ -2264,7 +2886,7 @@ export async function extractFromFile(
   }
 
   /* ------------------------------------------------------------------------ *
-   * TXT / TEXT / OTHER PLAIN BANK EXPORT
+   * TXT / TEXT / OTHER BANK EXPORT
    * ------------------------------------------------------------------------ */
 
   onProgress?.(
