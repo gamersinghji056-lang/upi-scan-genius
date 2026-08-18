@@ -5,10 +5,8 @@
  *
  * IMPORTANT:
  * - Transaction understanding happens in statement-core.ts.
- * - This file filters ONLY UPI CREDIT transactions.
- * - It does NOT independently guess debit/credit direction anymore.
- * - Missing UTR does NOT delete a valid UPI credit transaction.
- *   It is returned as "N/A".
+ * - This file only filters UPI CREDIT transactions.
+ * - Missing UTR does not delete a valid UPI credit transaction.
  * ========================================================================== */
 
 import {
@@ -48,29 +46,20 @@ export const extractDate =
 
 export type UpiCredit = {
   date: string;
-
   utr: string;
-
   amount: string;
-
   mode: "UPI";
 };
 
 /* -------------------------------------------------------------------------- *
  * Debug types
- *
- * Keep these compatible with the existing UI.
  * -------------------------------------------------------------------------- */
 
 export type RowDiagnostic = {
   index: number;
-
   preview: string;
-
   hasDate: boolean;
-
   isUpi: boolean;
-
   references: number;
 
   direction:
@@ -89,28 +78,21 @@ export type RowDiagnostic = {
 
 export type ExtractDebug = {
   inputLines: number;
-
   transactionRows: number;
-
   upiRows: number;
-
   rowsWithReference: number;
-
   creditRows: number;
-
   accepted: number;
 
   columns:
     | ColumnMap
     | null;
 
-  rows:
-    RowDiagnostic[];
+  rows: RowDiagnostic[];
 };
 
 export type ExtractResult = {
   rows: UpiCredit[];
-
   debug: ExtractDebug;
 };
 
@@ -118,11 +100,6 @@ export type ExtractResult = {
  * UPI REFERENCE HELPERS
  * ========================================================================== */
 
-/**
- * Returns all standalone 12-digit numeric candidates.
- *
- * Kept for backward compatibility and debugging.
- */
 export function extractUtrCandidates(
   text: string,
 ): string[] {
@@ -138,17 +115,6 @@ export function extractUtrCandidates(
   );
 }
 
-/**
- * Uses the SAME shared reference intelligence as statement-core.
- *
- * Priority is therefore consistent with:
- *
- * - UTR
- * - RRN
- * - dedicated reference
- * - UPI-specific reference
- * - generic candidate
- */
 export function extractUtr(
   text: string,
 ): string | null {
@@ -175,8 +141,7 @@ export function extractUtr(
  * ========================================================================== */
 
 function toUpiCredit(
-  transaction:
-    CoreTransaction,
+  transaction: CoreTransaction,
 ): UpiCredit | null {
   if (
     !isUpiCredit(
@@ -188,9 +153,9 @@ function toUpiCredit(
 
   if (
     transaction.amount ===
-    null ||
+      null ||
     transaction.amount <=
-    0
+      0
   ) {
     return null;
   }
@@ -199,10 +164,6 @@ function toUpiCredit(
     date:
       transaction.date,
 
-    /*
-     * Do not silently delete valid credits
-     * merely because bank does not expose a usable UTR.
-     */
     utr:
       transaction.reference ??
       "N/A",
@@ -276,53 +237,67 @@ function transactionDiagnostic(
     transaction.amount >
       0;
 
-  return {
-    index:
-      transaction.rowIndex,
+  const diagnostic:
+    RowDiagnostic = {
+      index:
+        transaction.rowIndex,
 
-    preview:
-      transaction.raw.slice(
-        0,
-        220,
-      ),
+      preview:
+        transaction.raw.slice(
+          0,
+          220,
+        ),
 
-    hasDate:
-      Boolean(
-        transaction.date,
-      ),
+      hasDate:
+        Boolean(
+          transaction.date,
+        ),
 
-    isUpi:
-      transaction.mode ===
-      "UPI",
+      isUpi:
+        transaction.mode ===
+        "UPI",
 
-    references:
-      transaction.reference
-        ? 1
-        : 0,
+      references:
+        transaction.reference
+          ? 1
+          : 0,
 
-    direction:
-      transaction.direction,
+      direction:
+        transaction.direction,
 
-    amount:
-      transaction.amount ===
-      null
-        ? null
-        : formatAmount(
-            transaction.amount,
-          ),
+      amount:
+        transaction.amount ===
+        null
+          ? null
+          : formatAmount(
+              transaction.amount,
+            ),
 
-    accepted,
+      accepted,
+    };
 
-    reason:
-      transactionReason(
-        transaction,
-        accepted,
-      ),
-  };
+  const reason =
+    transactionReason(
+      transaction,
+      accepted,
+    );
+
+  /*
+   * exactOptionalPropertyTypes-safe:
+   * only add reason when a string really exists.
+   */
+  if (
+    reason !== undefined
+  ) {
+    diagnostic.reason =
+      reason;
+  }
+
+  return diagnostic;
 }
 
 /* ========================================================================== *
- * RESULT BUILDER
+ * DEDUPE
  * ========================================================================== */
 
 function dedupe(
@@ -338,30 +313,31 @@ function dedupe(
     const row of rows
   ) {
     /*
-     * A real UTR is the strongest identity.
+     * Real UTR/reference is strongest identity.
      *
-     * When UTR is N/A, include amount and date so
-     * separate valid transactions do not collapse unnecessarily.
+     * For N/A rows we do not aggressively dedupe because
+     * two same-date / same-amount real credits can exist.
      */
-    const key =
+    if (
       row.utr !== "N/A"
-        ? `REF|${row.utr}`
-        : `NOREF|${row.date}|${row.amount}|${output.length}`;
-
-    if (
-      row.utr !==
-        "N/A" &&
-      seen.has(
-        key,
-      )
     ) {
-      continue;
-    }
+      const key =
+        [
+          row.utr,
+          row.amount,
+          row.mode,
+        ]
+          .join("|")
+          .toUpperCase();
 
-    if (
-      row.utr !==
-      "N/A"
-    ) {
+      if (
+        seen.has(
+          key,
+        )
+      ) {
+        continue;
+      }
+
       seen.add(
         key,
       );
@@ -375,26 +351,27 @@ function dedupe(
   return output;
 }
 
+/* ========================================================================== *
+ * RESULT BUILDER
+ * ========================================================================== */
+
 function resultFromCore(
   core: CoreResult,
   inputLines: number,
 ): ExtractResult {
-  const converted =
-    core.transactions
-      .map(
-        toUpiCredit,
-      )
-      .filter(
-        (
-          transaction,
-        ): transaction is UpiCredit =>
-          transaction !==
-          null,
-      );
-
   const rows =
     dedupe(
-      converted,
+      core.transactions
+        .map(
+          toUpiCredit,
+        )
+        .filter(
+          (
+            transaction,
+          ): transaction is UpiCredit =>
+            transaction !==
+            null,
+        ),
     );
 
   const diagnostics =
@@ -409,8 +386,7 @@ function resultFromCore(
       inputLines,
 
       transactionRows:
-        core.transactions
-          .length,
+        core.transactions.length,
 
       upiRows:
         core.transactions.filter(
@@ -456,20 +432,19 @@ function resultFromCore(
  * PUBLIC PARSERS
  * ========================================================================== */
 
-/**
- * PDF native text / OCR / TXT.
- */
 export function parseTextDetailed(
   text: string,
 ): ExtractResult {
-  const inputLines =
+  const normalized =
     String(
       text ?? "",
-    )
-      .replace(
-        /\r\n?/g,
-        "\n",
-      )
+    ).replace(
+      /\r\n?/g,
+      "\n",
+    );
+
+  const inputLines =
+    normalized
       .split(
         "\n",
       )
@@ -484,7 +459,7 @@ export function parseTextDetailed(
 
   const core =
     parseStatementText(
-      text,
+      normalized,
     );
 
   return resultFromCore(
@@ -493,9 +468,6 @@ export function parseTextDetailed(
   );
 }
 
-/**
- * XLS / XLSX / CSV structured rows.
- */
 export function parseRowsDetailed(
   rows: Row[],
 ): ExtractResult {
@@ -543,11 +515,7 @@ export function parseRows(
 }
 
 /* ========================================================================== *
- * MERGE
- *
- * Used by statement-readers when:
- * - multiple files are uploaded
- * - PDF native text + OCR both produce results
+ * MERGE EXISTING RESULTS
  * ========================================================================== */
 
 export function mergeResults(
@@ -562,20 +530,12 @@ export function mergeResults(
 
       debug: {
         inputLines: 0,
-
         transactionRows: 0,
-
         upiRows: 0,
-
-        rowsWithReference:
-          0,
-
+        rowsWithReference: 0,
         creditRows: 0,
-
         accepted: 0,
-
         columns: null,
-
         rows: [],
       },
     };
@@ -602,8 +562,7 @@ export function mergeResults(
             result,
           ) =>
             total +
-            result.debug
-              .inputLines,
+            result.debug.inputLines,
           0,
         ),
 
@@ -614,8 +573,7 @@ export function mergeResults(
             result,
           ) =>
             total +
-            result.debug
-              .transactionRows,
+            result.debug.transactionRows,
           0,
         ),
 
@@ -626,8 +584,7 @@ export function mergeResults(
             result,
           ) =>
             total +
-            result.debug
-              .upiRows,
+            result.debug.upiRows,
           0,
         ),
 
@@ -638,8 +595,7 @@ export function mergeResults(
             result,
           ) =>
             total +
-            result.debug
-              .rowsWithReference,
+            result.debug.rowsWithReference,
           0,
         ),
 
@@ -650,8 +606,7 @@ export function mergeResults(
             result,
           ) =>
             total +
-            result.debug
-              .creditRows,
+            result.debug.creditRows,
           0,
         ),
 
@@ -663,11 +618,9 @@ export function mergeResults(
           (
             result,
           ) =>
-            result.debug
-              .columns !==
+            result.debug.columns !==
             null,
-        )?.debug
-          .columns ??
+        )?.debug.columns ??
         null,
 
       rows:
@@ -682,9 +635,11 @@ export function mergeResults(
 }
 
 /* ========================================================================== *
- * OPTIONAL CORE MERGE
+ * CORE MERGE
  *
- * This export is useful for the upcoming statement-readers update.
+ * Used later by statement-readers for:
+ * - native PDF + OCR
+ * - multiple text passes
  * ========================================================================== */
 
 export function parseAndMergeCoreTexts(
@@ -712,7 +667,9 @@ export function parseAndMergeCoreTexts(
         text,
       ) =>
         total +
-        text
+        String(
+          text ?? "",
+        )
           .replace(
             /\r\n?/g,
             "\n",
@@ -738,7 +695,7 @@ export function parseAndMergeCoreTexts(
 }
 
 /* ========================================================================== *
- * CSV
+ * CSV EXPORT
  * ========================================================================== */
 
 function csvEscape(
