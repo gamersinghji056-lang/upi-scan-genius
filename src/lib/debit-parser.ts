@@ -1,16 +1,16 @@
 /* ========================================================================== *
  * UNIVERSAL DEBIT PARSER
  *
- * Thin compatibility layer over statement-core.ts.
+ * Thin compatibility layer over statement-core.ts V3.
  *
  * IMPORTANT:
  * - Debit/Credit understanding happens in statement-core.ts.
- * - This file does NOT independently guess direction anymore.
- * - Valid debit is retained even when UTR/reference is missing.
+ * - This file does not independently guess direction.
+ * - Valid debit is retained even if reference/UTR is unavailable.
  * - Payment-network debits:
  *     UPI / IMPS / NEFT / RTGS
- * - Other valid debits:
- *     charges / tax / self / cash / internal / StCon / misc.
+ * - Other debits:
+ *     charges / tax / cash / self / internal / StCon / miscellaneous
  * ========================================================================== */
 
 import {
@@ -18,17 +18,14 @@ import {
   extractReference,
   formatAmount,
   isAnyDebit,
-  isOtherDebit,
-  isPaymentDebit,
   mergeCoreResults,
   normalizeText,
   parseStatementRows,
   parseStatementText,
+  type ColumnMap,
   type CoreResult,
   type CoreTransaction,
-  type PaymentMode,
   type Row,
-  type ColumnMap,
 } from "./statement-core";
 
 /* -------------------------------------------------------------------------- *
@@ -44,22 +41,24 @@ export type DebitMode =
 
 export type DebitTxn = {
   date: string;
-
   utr: string;
-
   amount: string;
-
   mode: DebitMode;
 };
 
 export type DebitResult = {
+  /*
+   * Backward-compatible primary result.
+   * rows always contains ALL valid debits.
+   */
   rows: DebitTxn[];
 
-  allRows?: DebitTxn[];
-
-  paymentRows?: DebitTxn[];
-
-  otherRows?: DebitTxn[];
+  /*
+   * Explicit groups for UI.
+   */
+  allRows: DebitTxn[];
+  paymentRows: DebitTxn[];
+  otherRows: DebitTxn[];
 };
 
 /* -------------------------------------------------------------------------- *
@@ -69,12 +68,9 @@ export type DebitResult = {
 export function detectMode(
   text: string,
 ): DebitMode | null {
-  const mode =
-    coreDetectMode(
-      text,
-    );
-
-  return mode;
+  return coreDetectMode(
+    text,
+  );
 }
 
 /* -------------------------------------------------------------------------- *
@@ -87,8 +83,9 @@ export function extractDebitRef(
   cells?: Row,
   cols?: ColumnMap | null,
 ): string | null {
-  const row =
-    cells?.length
+  const row: Row =
+    cells &&
+    cells.length > 0
       ? cells
       : [
           normalizeText(
@@ -104,7 +101,7 @@ export function extractDebitRef(
 }
 
 /* ========================================================================== *
- * CORE -> DEBIT TRANSACTION
+ * CORE -> DEBIT
  * ========================================================================== */
 
 function toDebitTxn(
@@ -146,7 +143,7 @@ function toDebitTxn(
 }
 
 /* ========================================================================== *
- * DEDUPE
+ * DEDUPLICATION
  * ========================================================================== */
 
 function dedupeDebits(
@@ -162,10 +159,11 @@ function dedupeDebits(
     const row of rows
   ) {
     /*
-     * Real reference is strongest identity.
+     * Reference-backed transaction:
+     * use reference + mode + amount as identity.
      *
-     * For N/A rows we deliberately do not aggressively dedupe,
-     * because two legitimate same-date / same-amount debits can exist.
+     * N/A transactions are intentionally not aggressively deduplicated,
+     * because two genuine debits may have the same date and amount.
      */
     if (
       row.utr !== "N/A"
@@ -204,6 +202,17 @@ function dedupeDebits(
  * RESULT BUILDER
  * ========================================================================== */
 
+function isPaymentMode(
+  mode: DebitMode,
+): boolean {
+  return (
+    mode === "UPI" ||
+    mode === "IMPS" ||
+    mode === "NEFT" ||
+    mode === "RTGS"
+  );
+}
+
 function resultFromCore(
   core: CoreResult,
 ): DebitResult {
@@ -215,9 +224,10 @@ function resultFromCore(
         )
         .filter(
           (
-            row,
-          ): row is DebitTxn =>
-            row !== null,
+            transaction,
+          ): transaction is DebitTxn =>
+            transaction !==
+            null,
         ),
     );
 
@@ -226,14 +236,9 @@ function resultFromCore(
       (
         row,
       ) =>
-        row.mode ===
-          "UPI" ||
-        row.mode ===
-          "IMPS" ||
-        row.mode ===
-          "NEFT" ||
-        row.mode ===
-          "RTGS",
+        isPaymentMode(
+          row.mode,
+        ),
     );
 
   const otherRows =
@@ -246,15 +251,17 @@ function resultFromCore(
     );
 
   /*
-   * IMPORTANT:
+   * rows intentionally means ALL DEBITS.
    *
-   * rows = ALL DEBITS
+   * This prevents legitimate debit rows such as:
+   * - StCon
+   * - charges
+   * - GST
+   * - SELF
+   * - cash
+   * - internal transfer
    *
-   * This fixes the earlier problem where legitimate debit rows
-   * such as StCon / charges / internal debit disappeared.
-   *
-   * UI can separately use paymentRows if only
-   * UPI/IMPS/NEFT/RTGS are required.
+   * from silently disappearing.
    */
   return {
     rows:
@@ -272,6 +279,9 @@ function resultFromCore(
  * PUBLIC PARSERS
  * ========================================================================== */
 
+/**
+ * Native PDF text / OCR text / TXT.
+ */
 export function parseDebitsFromText(
   text: string,
 ): DebitResult {
@@ -285,10 +295,14 @@ export function parseDebitsFromText(
   );
 }
 
+/**
+ * XLS / XLSX / CSV structured rows.
+ */
 export function parseDebitsFromRows(
   rows: Row[],
 ): DebitResult {
-  const normalized =
+  const normalized:
+    Row[] =
     rows.map(
       (
         row,
@@ -318,8 +332,7 @@ export function parseDebitsFromRows(
  *
  * Useful for:
  * - native PDF + OCR
- * - multiple sheets
- * - multiple files
+ * - multiple parser passes
  * ========================================================================== */
 
 export function parseAndMergeDebitCoreTexts(
@@ -346,7 +359,7 @@ export function parseAndMergeDebitCoreTexts(
 }
 
 /* ========================================================================== *
- * MERGE EXISTING DEBIT RESULTS
+ * MERGE DEBIT RESULTS
  * ========================================================================== */
 
 export function mergeDebitResults(
@@ -370,8 +383,7 @@ export function mergeDebitResults(
           result,
         ) =>
           result.allRows ??
-          result.rows ??
-          [],
+          result.rows,
       ),
     );
 
@@ -380,14 +392,9 @@ export function mergeDebitResults(
       (
         row,
       ) =>
-        row.mode ===
-          "UPI" ||
-        row.mode ===
-          "IMPS" ||
-        row.mode ===
-          "NEFT" ||
-        row.mode ===
-          "RTGS",
+        isPaymentMode(
+          row.mode,
+        ),
     );
 
   const otherRows =
@@ -417,9 +424,7 @@ export function mergeDebitResults(
 
 export type ModeBreakdown = {
   mode: DebitMode;
-
   volume: number;
-
   count: number;
 };
 
@@ -472,7 +477,7 @@ export function debitBreakdown(
 }
 
 /* ========================================================================== *
- * PAYMENT-ONLY HELPERS
+ * FILTER HELPERS
  * ========================================================================== */
 
 export function paymentDebitRows(
@@ -482,14 +487,9 @@ export function paymentDebitRows(
     (
       row,
     ) =>
-      row.mode ===
-        "UPI" ||
-      row.mode ===
-        "IMPS" ||
-      row.mode ===
-        "NEFT" ||
-      row.mode ===
-        "RTGS",
+      isPaymentMode(
+        row.mode,
+      ),
   );
 }
 
@@ -504,6 +504,10 @@ export function otherDebitRows(
       "OTHER",
   );
 }
+
+/* ========================================================================== *
+ * TOTAL HELPERS
+ * ========================================================================== */
 
 export function paymentDebitTotal(
   rows: DebitTxn[],
@@ -527,6 +531,61 @@ export function allDebitTotal(
   rows: DebitTxn[],
 ): number {
   return rows.reduce(
+    (
+      total,
+      row,
+    ) =>
+      total +
+      Number(
+        row.amount,
+      ),
+    0,
+  );
+}
+
+export function otherDebitTotal(
+  rows: DebitTxn[],
+): number {
+  return otherDebitRows(
+    rows,
+  ).reduce(
+    (
+      total,
+      row,
+    ) =>
+      total +
+      Number(
+        row.amount,
+      ),
+    0,
+  );
+}
+
+/* ========================================================================== *
+ * INDIVIDUAL MODE TOTALS
+ * ========================================================================== */
+
+export function debitModeRows(
+  rows: DebitTxn[],
+  mode: DebitMode,
+): DebitTxn[] {
+  return rows.filter(
+    (
+      row,
+    ) =>
+      row.mode ===
+      mode,
+  );
+}
+
+export function debitModeTotal(
+  rows: DebitTxn[],
+  mode: DebitMode,
+): number {
+  return debitModeRows(
+    rows,
+    mode,
+  ).reduce(
     (
       total,
       row,
@@ -602,7 +661,7 @@ export function toDebitCsv(
 }
 
 /* ========================================================================== *
- * FILE NAME
+ * TIMESTAMPED FILE NAME
  * ========================================================================== */
 
 export function timestampName(
