@@ -29,7 +29,15 @@ import {
 } from "./statement-core";
 
 /* ========================================================================== *
- * PUBLIC TYPES
+ * STATEMENT READERS — V4
+ *
+ * Goals:
+ * - Preserve existing parser behavior for working banks.
+ * - Read XLS/XLSX/CSV sheet-by-sheet with inherited column maps.
+ * - Repair malformed Withdrawals/Deposits/Balance exports before core parsing.
+ * - Use native PDF text first and avoid OCR when a readable text layer exists.
+ * - Merge complementary native PDF parses instead of selecting one winner.
+ * - Keep OCR as a true last resort.
  * ========================================================================== */
 
 export type CombinedResult = {
@@ -84,6 +92,38 @@ function toDebit(
   };
 }
 
+function creditKey(
+  row: UpiCredit,
+): string | null {
+  if (row.utr === "N/A") {
+    return null;
+  }
+
+  return [
+    row.utr,
+    row.amount,
+    row.mode,
+  ]
+    .join("|")
+    .toUpperCase();
+}
+
+function debitKey(
+  row: DebitTxn,
+): string | null {
+  if (row.utr === "N/A") {
+    return null;
+  }
+
+  return [
+    row.utr,
+    row.amount,
+    row.mode,
+  ]
+    .join("|")
+    .toUpperCase();
+}
+
 function dedupeCredits(
   rows: UpiCredit[],
 ): UpiCredit[] {
@@ -91,24 +131,16 @@ function dedupeCredits(
   const output: UpiCredit[] = [];
 
   for (const row of rows) {
-    if (row.utr === "N/A") {
-      output.push(row);
-      continue;
+    const key = creditKey(row);
+
+    if (key !== null) {
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
     }
 
-    const key = [
-      row.utr,
-      row.amount,
-      row.mode,
-    ]
-      .join("|")
-      .toUpperCase();
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
     output.push(row);
   }
 
@@ -122,24 +154,16 @@ function dedupeDebits(
   const output: DebitTxn[] = [];
 
   for (const row of rows) {
-    if (row.utr === "N/A") {
-      output.push(row);
-      continue;
+    const key = debitKey(row);
+
+    if (key !== null) {
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
     }
 
-    const key = [
-      row.utr,
-      row.mode,
-      row.amount,
-    ]
-      .join("|")
-      .toUpperCase();
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
     output.push(row);
   }
 
@@ -260,15 +284,12 @@ function combinedFromCore(
     rowsWithReference:
       core.transactions.filter(
         (transaction) =>
-          Boolean(
-            transaction.reference,
-          ),
+          Boolean(transaction.reference),
       ).length,
     creditRows:
       core.transactions.filter(
         (transaction) =>
-          transaction.direction ===
-          "credit",
+          transaction.direction === "credit",
       ).length,
     accepted: creditRows.length,
     columns: core.columns,
@@ -348,8 +369,7 @@ export function mergeCombined(
   const columns =
     list.find(
       (result) =>
-        result.credit.debug
-          .columns !== null,
+        result.credit.debug.columns !== null,
     )?.credit.debug.columns ??
     null;
 
@@ -361,40 +381,35 @@ export function mergeCombined(
           list.reduce(
             (total, result) =>
               total +
-              result.credit.debug
-                .inputLines,
+              result.credit.debug.inputLines,
             0,
           ),
         transactionRows:
           list.reduce(
             (total, result) =>
               total +
-              result.credit.debug
-                .transactionRows,
+              result.credit.debug.transactionRows,
             0,
           ),
         upiRows:
           list.reduce(
             (total, result) =>
               total +
-              result.credit.debug
-                .upiRows,
+              result.credit.debug.upiRows,
             0,
           ),
         rowsWithReference:
           list.reduce(
             (total, result) =>
               total +
-              result.credit.debug
-                .rowsWithReference,
+              result.credit.debug.rowsWithReference,
             0,
           ),
         creditRows:
           list.reduce(
             (total, result) =>
               total +
-              result.credit.debug
-                .creditRows,
+              result.credit.debug.creditRows,
             0,
           ),
         accepted: credits.length,
@@ -421,6 +436,161 @@ export function mergeCombined(
       ),
     ],
   };
+}
+
+/* ========================================================================== *
+ * CORE CANDIDATE MERGE
+ * ========================================================================== */
+
+function transactionQuality(
+  transaction: CoreTransaction,
+): number {
+  let score = 0;
+
+  if (transaction.direction !== "unknown") {
+    score += 10;
+  }
+
+  if (transaction.amount !== null) {
+    score += 8;
+  }
+
+  if (transaction.reference) {
+    score += 5;
+  }
+
+  if (transaction.mode !== "OTHER") {
+    score += 3;
+  }
+
+  if (transaction.balance !== null) {
+    score += 2;
+  }
+
+  if (transaction.confidence === "high") {
+    score += 3;
+  } else if (
+    transaction.confidence === "medium"
+  ) {
+    score += 1;
+  }
+
+  return score;
+}
+
+function nativeTransactionKey(
+  transaction: CoreTransaction,
+): string {
+  if (transaction.reference) {
+    return [
+      "REF",
+      transaction.reference,
+      transaction.direction,
+      transaction.mode,
+    ]
+      .join("|")
+      .toUpperCase();
+  }
+
+  return [
+    "NOREF",
+    transaction.date,
+    transaction.direction,
+    transaction.mode,
+    transaction.amount?.toFixed(2) ?? "",
+    normalizeText(
+      transaction.narration,
+    ).slice(0, 100),
+  ]
+    .join("|")
+    .toUpperCase();
+}
+
+function mergeCoreCandidates(
+  results: CoreResult[],
+): CoreResult {
+  const map =
+    new Map<
+      string,
+      CoreTransaction
+    >();
+
+  let columns:
+    ColumnMap | null =
+    null;
+
+  let summary:
+    CoreResult["summary"] =
+    null;
+
+  const warnings =
+    new Set<string>();
+
+  for (const result of results) {
+    if (
+      columns === null &&
+      result.columns !== null
+    ) {
+      columns = result.columns;
+    }
+
+    if (
+      summary === null &&
+      result.summary !== null
+    ) {
+      summary = result.summary;
+    }
+
+    result.warnings.forEach(
+      (warning) =>
+        warnings.add(warning),
+    );
+
+    for (
+      const transaction of
+      result.transactions
+    ) {
+      const key =
+        nativeTransactionKey(
+          transaction,
+        );
+
+      const old =
+        map.get(key);
+
+      if (
+        !old ||
+        transactionQuality(
+          transaction,
+        ) >
+          transactionQuality(old)
+      ) {
+        map.set(
+          key,
+          transaction,
+        );
+      }
+    }
+  }
+
+  return {
+    transactions:
+      [...map.values()],
+    columns,
+    summary,
+    warnings:
+      [...warnings],
+  };
+}
+
+function knownTransactionCount(
+  core: CoreResult,
+): number {
+  return core.transactions.filter(
+    (transaction) =>
+      transaction.direction !== "unknown" &&
+      transaction.amount !== null,
+  ).length;
 }
 
 /* ========================================================================== *
@@ -479,15 +649,12 @@ function moneyParts(
 function strongCreditNarration(
   text: string,
 ): boolean {
-  const normalized =
-    normalizeText(text);
-
   return (
     /(?:^|[/_: -])UPI[/_: -]+CR(?:[/_: -]|$)/i.test(
-      normalized,
+      normalizeText(text),
     ) ||
     /\b(?:credited|credit received|amount received|deposited)\b/i.test(
-      normalized,
+      normalizeText(text),
     )
   );
 }
@@ -554,8 +721,7 @@ function repairShiftedAmountBalanceRows(
       moneyParts(creditCell);
 
     const narration =
-      columns.narration ===
-      undefined
+      columns.narration === undefined
         ? row.join(" ")
         : normalizeText(
             row[
@@ -568,69 +734,26 @@ function repairShiftedAmountBalanceRows(
         narration,
       );
 
-    if (isStrongCredit) {
-      if (
-        debitParts.length >= 2 &&
-        creditParts.length === 0
-      ) {
-        row[
-          columns.debit
-        ] = "";
+    if (
+      isStrongCredit &&
+      debitParts.length === 1 &&
+      creditParts.length === 1
+    ) {
+      row[
+        columns.debit
+      ] = "";
 
-        row[
-          columns.credit
-        ] =
-          debitParts[0] ?? "";
+      row[
+        columns.credit
+      ] =
+        debitParts[0] ?? "";
 
-        row[
-          columns.balance
-        ] =
-          debitParts[
-            debitParts.length - 1
-          ] ?? "";
+      row[
+        columns.balance
+      ] =
+        creditParts[0] ?? "";
 
-        continue;
-      }
-
-      if (
-        debitParts.length === 1 &&
-        creditParts.length === 1
-      ) {
-        row[
-          columns.debit
-        ] = "";
-
-        row[
-          columns.credit
-        ] =
-          debitParts[0] ?? "";
-
-        row[
-          columns.balance
-        ] =
-          creditParts[0] ?? "";
-
-        continue;
-      }
-
-      if (
-        debitParts.length === 0 &&
-        creditParts.length >= 2
-      ) {
-        row[
-          columns.credit
-        ] =
-          creditParts[0] ?? "";
-
-        row[
-          columns.balance
-        ] =
-          creditParts[
-            creditParts.length - 1
-          ] ?? "";
-
-        continue;
-      }
+      continue;
     }
 
     if (
@@ -656,10 +779,21 @@ function repairShiftedAmountBalanceRows(
       creditParts.length === 0 &&
       debitParts.length >= 2
     ) {
-      row[
-        columns.debit
-      ] =
-        debitParts[0] ?? "";
+      if (isStrongCredit) {
+        row[
+          columns.debit
+        ] = "";
+
+        row[
+          columns.credit
+        ] =
+          debitParts[0] ?? "";
+      } else {
+        row[
+          columns.debit
+        ] =
+          debitParts[0] ?? "";
+      }
 
       row[
         columns.balance
@@ -715,7 +849,7 @@ async function loadPdfjs(): Promise<any> {
           worker.default;
       }
     } catch {
-      // optional worker URL
+      // Worker URL is optional.
     }
 
     return pdfjs;
@@ -740,7 +874,7 @@ async function loadPdfjs(): Promise<any> {
           worker.default;
       }
     } catch {
-      // keep standard build alive
+      // Standard build can still report a useful loading error.
     }
 
     return pdfjs;
@@ -756,12 +890,8 @@ type PdfTextItem = {
 type PdfPageExtraction = {
   pageNumber: number;
   rows: Row[];
-  visualText: string;
   sequentialText: string;
   characterCount: number;
-  datedRows: number;
-  paymentRows: number;
-  numericRows: number;
   unreadable: boolean;
 };
 
@@ -776,7 +906,7 @@ function coercePdfItems(
     value &&
     typeof value === "object"
   ) {
-    const maybeLength =
+    const length =
       Number(
         (
           value as {
@@ -786,17 +916,15 @@ function coercePdfItems(
       );
 
     if (
-      Number.isInteger(
-        maybeLength,
-      ) &&
-      maybeLength >= 0
+      Number.isInteger(length) &&
+      length >= 0
     ) {
-      const out:
+      const output:
         PdfTextItem[] = [];
 
       for (
         let index = 0;
-        index < maybeLength;
+        index < length;
         index++
       ) {
         const item =
@@ -811,14 +939,14 @@ function coercePdfItems(
           item &&
           typeof item === "object"
         ) {
-          out.push(
+          output.push(
             item as PdfTextItem,
           );
         }
       }
 
-      if (out.length) {
-        return out;
+      if (output.length > 0) {
+        return output;
       }
     }
 
@@ -833,8 +961,7 @@ function coercePdfItems(
       ];
 
     if (
-      typeof iterator ===
-      "function"
+      typeof iterator === "function"
     ) {
       try {
         return Array.from(
@@ -849,13 +976,12 @@ function coercePdfItems(
   return [];
 }
 
-function numericTransformValue(
+function transformNumber(
   transform: unknown,
   index: number,
 ): number {
   if (
-    transform === null ||
-    transform === undefined ||
+    !transform ||
     typeof transform !== "object"
   ) {
     return 0;
@@ -869,11 +995,11 @@ function numericTransformValue(
       >
     )[index];
 
-  const n =
+  const number =
     Number(value);
 
-  return Number.isFinite(n)
-    ? n
+  return Number.isFinite(number)
+    ? number
     : 0;
 }
 
@@ -885,7 +1011,7 @@ function groupPdfItems(
       itemsValue,
     );
 
-  const buckets =
+  const lines =
     new Map<
       number,
       Array<{
@@ -894,21 +1020,10 @@ function groupPdfItems(
       }>
     >();
 
-  for (
-    let index = 0;
-    index < items.length;
-    index++
-  ) {
-    const item =
-      items[index];
-
-    if (!item?.str) {
-      continue;
-    }
-
+  for (const item of items) {
     const text =
       normalizeText(
-        item.str,
+        item.str ?? "",
       );
 
     if (!text) {
@@ -916,13 +1031,13 @@ function groupPdfItems(
     }
 
     const x =
-      numericTransformValue(
+      transformNumber(
         item.transform,
         4,
       );
 
     const y =
-      numericTransformValue(
+      transformNumber(
         item.transform,
         5,
       );
@@ -932,40 +1047,38 @@ function groupPdfItems(
         y / 2.5,
       ) * 2.5;
 
-    const bucket =
-      buckets.get(key) ??
+    const line =
+      lines.get(key) ??
       [];
 
-    bucket.push({
+    line.push({
       x,
       text,
     });
 
-    buckets.set(
+    lines.set(
       key,
-      bucket,
+      line,
     );
   }
 
-  return Array.from(
-    buckets.entries(),
-  )
+  return [
+    ...lines.entries(),
+  ]
     .sort(
       (a, b) =>
         b[0] - a[0],
     )
     .map(
-      ([, row]) =>
-        row
+      ([, line]) =>
+        line
           .sort(
             (a, b) =>
               a.x - b.x,
           )
           .map(
             (item) =>
-              normalizeText(
-                item.text,
-              ),
+              item.text,
           )
           .filter(Boolean),
     )
@@ -973,17 +1086,6 @@ function groupPdfItems(
       (row) =>
         row.length > 0,
     );
-}
-
-function rowsToText(
-  rows: Row[],
-): string {
-  return rows
-    .map(
-      (row) =>
-        row.join(" "),
-    )
-    .join("\n");
 }
 
 function sequentialPdfText(
@@ -996,17 +1098,10 @@ function sequentialPdfText(
 
   let output = "";
 
-  for (
-    let index = 0;
-    index < items.length;
-    index++
-  ) {
-    const item =
-      items[index];
-
+  for (const item of items) {
     const text =
       normalizeText(
-        item?.str ?? "",
+        item.str ?? "",
       );
 
     if (!text) {
@@ -1023,90 +1118,15 @@ function sequentialPdfText(
 
     output += text;
 
-    if (item?.hasEOL) {
-      output += "\n";
-    } else {
-      output += " ";
-    }
+    output += item.hasEOL
+      ? "\n"
+      : " ";
   }
 
   return output
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-const DATE_SIGNAL =
-  /\b(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/\s][A-Za-z]{3,9}[-/\s]\d{2,4})\b/;
-
-const PAYMENT_SIGNAL =
-  /\b(?:UPI|IMPS|NEFT|RTGS|IBNEFT|IBRTGS|ENEFT|ERTGS|BHIM|P2A|P2P|TRTR)\b/i;
-
-const MONEY_SIGNAL =
-  /(?:₹\s*)?(?:\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+\.\d{1,2})/;
-
-function evaluatePdfPage(
-  pageNumber: number,
-  rows: Row[],
-  sequentialText: string,
-): PdfPageExtraction {
-  const visualText =
-    rowsToText(rows);
-
-  const bestText =
-    visualText.length >=
-    sequentialText.length
-      ? visualText
-      : sequentialText;
-
-  const characterCount =
-    bestText
-      .replace(/\s/g, "")
-      .length;
-
-  let datedRows = 0;
-  let paymentRows = 0;
-  let numericRows = 0;
-
-  const lines =
-    bestText
-      .split(/\n+/)
-      .map(
-        (line) =>
-          line.trim(),
-      )
-      .filter(Boolean);
-
-  for (const line of lines) {
-    if (DATE_SIGNAL.test(line)) {
-      datedRows++;
-    }
-
-    if (
-      PAYMENT_SIGNAL.test(line)
-    ) {
-      paymentRows++;
-    }
-
-    if (MONEY_SIGNAL.test(line)) {
-      numericRows++;
-    }
-  }
-
-  const unreadable =
-    characterCount < 40;
-
-  return {
-    pageNumber,
-    rows,
-    visualText,
-    sequentialText,
-    characterCount,
-    datedRows,
-    paymentRows,
-    numericRows,
-    unreadable,
-  };
 }
 
 async function extractPdfPages(
@@ -1134,31 +1154,37 @@ async function extractPdfPages(
       const content =
         await page.getTextContent();
 
+      const sequentialText =
+        sequentialPdfText(
+          content?.items,
+        );
+
       const rows =
         groupPdfItems(
           content?.items,
         );
 
-      const sequential =
-        sequentialPdfText(
-          content?.items,
-        );
+      const characterCount =
+        sequentialText
+          .replace(/\s/g, "")
+          .length;
 
-      pages.push(
-        evaluatePdfPage(
-          pageNumber,
-          rows,
-          sequential,
-        ),
-      );
+      pages.push({
+        pageNumber,
+        rows,
+        sequentialText,
+        characterCount,
+        unreadable:
+          characterCount < 40,
+      });
     } catch {
-      pages.push(
-        evaluatePdfPage(
-          pageNumber,
-          [],
-          "",
-        ),
-      );
+      pages.push({
+        pageNumber,
+        rows: [],
+        sequentialText: "",
+        characterCount: 0,
+        unreadable: true,
+      });
     }
   }
 
@@ -1166,7 +1192,7 @@ async function extractPdfPages(
 }
 
 /* ========================================================================== *
- * PDF PAGE -> IMAGE
+ * OCR
  * ========================================================================== */
 
 async function pageToDataUrl(
@@ -1186,10 +1212,10 @@ async function pageToDataUrl(
   const targetWidth =
     Math.min(
       Math.max(
-        base.width * 1.7,
-        1200,
+        base.width * 1.45,
+        1000,
       ),
-      1800,
+      1500,
     );
 
   const viewport =
@@ -1233,7 +1259,7 @@ async function pageToDataUrl(
 
   return canvas.toDataURL(
     "image/jpeg",
-    0.88,
+    0.84,
   );
 }
 
@@ -1269,10 +1295,6 @@ async function fileToDataUrl(
   );
 }
 
-/* ========================================================================== *
- * OCR
- * ========================================================================== */
-
 async function ocrImages(
   images: string[],
 ): Promise<string> {
@@ -1303,9 +1325,9 @@ async function ocrPdfPages(
   onProgress?: ExtractProgress,
 ): Promise<OcrBatchResult> {
   const unique =
-    Array.from(
-      new Set(pages),
-    )
+    [
+      ...new Set(pages),
+    ]
       .filter(
         (page) =>
           page >= 1 &&
@@ -1323,69 +1345,46 @@ async function ocrPdfPages(
   const failedPages:
     number[] = [];
 
-  const BATCH_SIZE = 2;
-
   for (
-    let start = 0;
-    start < unique.length;
-    start += BATCH_SIZE
+    let index = 0;
+    index < unique.length;
+    index++
   ) {
-    const batch =
-      unique.slice(
-        start,
-        start + BATCH_SIZE,
-      );
+    const pageNumber =
+      unique[index];
 
-    onProgress?.(
-      `Deep reading PDF pages ${start + 1}-${Math.min(
-        start + batch.length,
-        unique.length,
-      )} of ${unique.length}…`,
-    );
-
-    const images: string[] = [];
-    const renderedPages:
-      number[] = [];
-
-    for (const pageNumber of batch) {
-      try {
-        images.push(
-          await pageToDataUrl(
-            doc,
-            pageNumber,
-          ),
-        );
-
-        renderedPages.push(
-          pageNumber,
-        );
-      } catch {
-        failedPages.push(
-          pageNumber,
-        );
-      }
-    }
-
-    if (images.length === 0) {
+    if (
+      pageNumber === undefined
+    ) {
       continue;
     }
 
+    onProgress?.(
+      `OCR fallback page ${index + 1} of ${unique.length}…`,
+    );
+
     try {
-      const text =
-        await ocrImages(
-          images,
+      const image =
+        await pageToDataUrl(
+          doc,
+          pageNumber,
         );
+
+      const text =
+        await ocrImages([
+          image,
+        ]);
 
       if (text.trim()) {
         texts.push(text);
       } else {
         failedPages.push(
-          ...renderedPages,
+          pageNumber,
         );
       }
     } catch {
       failedPages.push(
-        ...renderedPages,
+        pageNumber,
       );
     }
   }
@@ -1393,91 +1392,15 @@ async function ocrPdfPages(
   return {
     texts,
     failedPages:
-      Array.from(
-        new Set(
+      [
+        ...new Set(
           failedPages,
         ),
-      ).sort(
+      ].sort(
         (a, b) =>
           a - b,
       ),
   };
-}
-
-/* ========================================================================== *
- * CORE QUALITY
- * ========================================================================== */
-
-function knownTransactionCount(
-  core: CoreResult,
-): number {
-  return core.transactions
-    .filter(
-      (transaction) =>
-        transaction.direction !==
-          "unknown" &&
-        transaction.amount !== null,
-    )
-    .length;
-}
-
-function coreScore(
-  core: CoreResult,
-): number {
-  const known =
-    knownTransactionCount(core);
-
-  const withReference =
-    core.transactions.filter(
-      (transaction) =>
-        Boolean(
-          transaction.reference,
-        ),
-    ).length;
-
-  const withMode =
-    core.transactions.filter(
-      (transaction) =>
-        transaction.mode !== "OTHER",
-    ).length;
-
-  return (
-    known * 10 +
-    withReference * 2 +
-    withMode +
-    core.transactions.length
-  );
-}
-
-function betterCore(
-  first: CoreResult,
-  second: CoreResult,
-): CoreResult {
-  return coreScore(second) >
-    coreScore(first)
-    ? second
-    : first;
-}
-
-function bestCore(
-  cores: CoreResult[],
-): CoreResult {
-  if (cores.length === 0) {
-    return {
-      transactions: [],
-      columns: null,
-      summary: null,
-      warnings: [],
-    };
-  }
-
-  return cores.reduce(
-    (best, current) =>
-      betterCore(
-        best,
-        current,
-      ),
-  );
 }
 
 /* ========================================================================== *
@@ -1489,7 +1412,7 @@ async function readPdf(
   onProgress?: ExtractProgress,
 ): Promise<CombinedResult> {
   onProgress?.(
-    "Opening PDF…",
+    "Reader V4: opening PDF…",
   );
 
   let pdfjs: any;
@@ -1511,13 +1434,10 @@ async function readPdf(
         await file.arrayBuffer(),
       );
 
-    const loadingTask =
-      pdfjs.getDocument({
-        data: bytes,
-      });
-
     doc =
-      await loadingTask.promise;
+      await pdfjs.getDocument({
+        data: bytes,
+      }).promise;
   } catch (error) {
     const message =
       error instanceof Error
@@ -1540,13 +1460,15 @@ async function readPdf(
   }
 
   onProgress?.(
-    `Reading ${Number(
+    `Reader V4: reading ${Number(
       doc?.numPages ?? 0,
     )} PDF page(s)…`,
   );
 
   const pages =
-    await extractPdfPages(doc);
+    await extractPdfPages(
+      doc,
+    );
 
   const allRows =
     pages.flatMap(
@@ -1555,7 +1477,9 @@ async function readPdf(
     );
 
   const detectedColumns =
-    findColumns(allRows).columns;
+    findColumns(
+      allRows,
+    ).columns;
 
   const repairedRows =
     repairShiftedAmountBalanceRows(
@@ -1563,20 +1487,17 @@ async function readPdf(
       detectedColumns,
     );
 
-  const structuredCore =
-    parseStatementRows(
-      repairedRows,
-      detectedColumns,
-    );
+  const nativeCores:
+    CoreResult[] = [];
 
-  const visualText =
-    pages
-      .map(
-        (page) =>
-          page.visualText,
-      )
-      .filter(Boolean)
-      .join("\n");
+  if (repairedRows.length > 0) {
+    nativeCores.push(
+      parseStatementRows(
+        repairedRows,
+        detectedColumns,
+      ),
+    );
+  }
 
   const sequentialText =
     pages
@@ -1587,21 +1508,8 @@ async function readPdf(
       .filter(Boolean)
       .join("\n");
 
-  const nativeCandidates:
-    CoreResult[] = [
-      structuredCore,
-    ];
-
-  if (visualText.trim()) {
-    nativeCandidates.push(
-      parseStatementText(
-        visualText,
-      ),
-    );
-  }
-
   if (sequentialText.trim()) {
-    nativeCandidates.push(
+    nativeCores.push(
       parseStatementText(
         sequentialText,
       ),
@@ -1609,11 +1517,19 @@ async function readPdf(
   }
 
   const nativeCore =
-    bestCore(
-      nativeCandidates,
+    mergeCoreCandidates(
+      nativeCores,
     );
 
-  const ocrPages =
+  const nativeCharacters =
+    pages.reduce(
+      (total, page) =>
+        total +
+        page.characterCount,
+      0,
+    );
+
+  const unreadablePages =
     pages
       .filter(
         (page) =>
@@ -1624,24 +1540,17 @@ async function readPdf(
           page.pageNumber,
       );
 
-  const nativeCharacters =
-    pages.reduce(
-      (total, page) =>
-        total +
-        page.characterCount,
-      0,
-    );
-
   if (
-    ocrPages.length === 0
+    knownTransactionCount(
+      nativeCore,
+    ) > 0
   ) {
     const warnings =
-      knownTransactionCount(
-        nativeCore,
-      ) === 0 &&
-      nativeCharacters >= 200
+      unreadablePages.length > 0
         ? [
-            "Native PDF text was readable, but transaction columns could not be fully classified. OCR was not required because the PDF already contains a text layer.",
+            `Native PDF text was used. Page(s) ${unreadablePages.join(
+              ", ",
+            )} had weak text extraction, but OCR was skipped because valid transactions were already recovered.`,
           ]
         : [];
 
@@ -1652,74 +1561,72 @@ async function readPdf(
     );
   }
 
+  if (
+    nativeCharacters >= 200
+  ) {
+    return combinedFromCore(
+      nativeCore,
+      repairedRows.length,
+      [
+        "The PDF contains readable native text, but no transaction could be classified. OCR was intentionally skipped to avoid slow unnecessary processing.",
+      ],
+    );
+  }
+
+  if (
+    unreadablePages.length === 0
+  ) {
+    return combinedFromCore(
+      nativeCore,
+      repairedRows.length,
+    );
+  }
+
   onProgress?.(
-    `${ocrPages.length} unreadable PDF page(s) need deeper reading…`,
+    `${unreadablePages.length} scanned/unreadable PDF page(s) require OCR…`,
   );
 
   const ocrResult =
     await ocrPdfPages(
       doc,
-      ocrPages,
+      unreadablePages,
       onProgress,
     );
 
   if (
     ocrResult.texts.length === 0
   ) {
-    if (
-      nativeCharacters > 0 ||
-      knownTransactionCount(
-        nativeCore,
-      ) > 0
-    ) {
-      return combinedFromCore(
-        nativeCore,
-        repairedRows.length,
-        [
-          `OCR could not verify PDF page(s): ${ocrResult.failedPages.join(
-            ", ",
-          )}. Native PDF text was used instead.`,
-        ],
-      );
-    }
-
     throw new Error(
-      `The PDF opened, but ${ocrPages.length} page(s) had no usable native text and OCR failed.`,
+      `The PDF has no usable native text and OCR failed for page(s): ${unreadablePages.join(
+        ", ",
+      )}.`,
     );
   }
 
-  const finalCandidates:
-    CoreResult[] = [
-      nativeCore,
-      ...ocrResult.texts
-        .filter(
-          (text) =>
-            Boolean(
-              text.trim(),
-            ),
-        )
-        .map(
-          (text) =>
-            parseStatementText(
-              text,
-            ),
+  const ocrCores =
+    ocrResult.texts.map(
+      (text) =>
+        parseStatementText(
+          text,
         ),
-    ];
-
-  const finalCore =
-    bestCore(
-      finalCandidates,
     );
 
-  const warnings: string[] = [];
+  const finalCore =
+    mergeCoreCandidates([
+      nativeCore,
+      ...ocrCores,
+    ]);
+
+  const warnings:
+    string[] = [];
 
   if (
     ocrResult.failedPages.length > 0
   ) {
     warnings.push(
-      `OCR could not verify PDF page(s): ${ocrResult.failedPages.join(
+      `OCR could not read PDF page(s): ${ocrResult.failedPages.join(
         ", ",
-      )}. Native PDF text was used for those pages where available.`,
+      )}.`,
     );
   }
 
@@ -1767,14 +1674,18 @@ function excelCellText(
     return `${dd}/${mm}/${value.getFullYear()}`;
   }
 
-  return normalizeText(value);
+  return normalizeText(
+    value,
+  );
 }
 
 async function readWorkbookSheets(
   file: File,
 ): Promise<WorkbookSheet[]> {
   const XLSX =
-    await import("xlsx");
+    await import(
+      "xlsx"
+    );
 
   const workbook =
     XLSX.read(
@@ -1782,7 +1693,7 @@ async function readWorkbookSheets(
       {
         type: "array",
         raw: false,
-        cellDates: false,
+        cellDates: true,
       },
     );
 
@@ -1813,11 +1724,12 @@ async function readWorkbookSheets(
         },
       ) as unknown[][];
 
-    const rows: Row[] =
+    const rows:
+      Row[] =
       data
         .map(
-          (rawRow) =>
-            rawRow.map(
+          (row) =>
+            row.map(
               excelCellText,
             ),
         )
@@ -1837,140 +1749,6 @@ async function readWorkbookSheets(
   return sheets;
 }
 
-function columnSignature(
-  columns: ColumnMap | null,
-): string {
-  if (columns === null) {
-    return "";
-  }
-
-  return [
-    columns.serial,
-    columns.date,
-    columns.valueDate,
-    columns.narration,
-    columns.reference,
-    columns.debit,
-    columns.credit,
-    columns.amount,
-    columns.type,
-    columns.balance,
-    columns.balanceType,
-    columns.channel,
-  ]
-    .map(
-      (value) =>
-        value === undefined
-          ? "-"
-          : String(value),
-    )
-    .join("|");
-}
-
-type SheetGroup = {
-  rows: Row[];
-  columns: ColumnMap | null;
-};
-
-function groupWorkbookSheets(
-  sheets: WorkbookSheet[],
-): SheetGroup[] {
-  const groups: SheetGroup[] = [];
-
-  let currentRows: Row[] = [];
-  let currentColumns:
-    ColumnMap | null = null;
-  let currentSignature = "";
-
-  const flush = () => {
-    if (currentRows.length === 0) {
-      return;
-    }
-
-    groups.push({
-      rows: currentRows,
-      columns: currentColumns,
-    });
-
-    currentRows = [];
-    currentColumns = null;
-    currentSignature = "";
-  };
-
-  for (const sheet of sheets) {
-    const detected =
-      findColumns(
-        sheet.rows,
-      ).columns;
-
-    const signature =
-      columnSignature(
-        detected,
-      );
-
-    if (currentRows.length === 0) {
-      currentRows = [
-        ...sheet.rows,
-      ];
-
-      currentColumns =
-        detected;
-
-      currentSignature =
-        signature;
-
-      continue;
-    }
-
-    if (detected === null) {
-      currentRows.push(
-        ...sheet.rows,
-      );
-      continue;
-    }
-
-    if (currentColumns === null) {
-      currentRows.push(
-        ...sheet.rows,
-      );
-
-      currentColumns =
-        detected;
-
-      currentSignature =
-        signature;
-
-      continue;
-    }
-
-    if (
-      signature ===
-      currentSignature
-    ) {
-      currentRows.push(
-        ...sheet.rows,
-      );
-      continue;
-    }
-
-    flush();
-
-    currentRows = [
-      ...sheet.rows,
-    ];
-
-    currentColumns =
-      detected;
-
-    currentSignature =
-      signature;
-  }
-
-  flush();
-
-  return groups;
-}
-
 function parseWorkbook(
   sheets: WorkbookSheet[],
   onProgress?: ExtractProgress,
@@ -1979,43 +1757,58 @@ function parseWorkbook(
     return emptyCombined();
   }
 
-  const groups =
-    groupWorkbookSheets(
-      sheets,
-    );
-
-  const combined:
+  const results:
     CombinedResult[] = [];
+
+  let inheritedColumns:
+    ColumnMap | null =
+    null;
 
   for (
     let index = 0;
-    index < groups.length;
+    index < sheets.length;
     index++
   ) {
-    const group =
-      groups[index];
+    const sheet =
+      sheets[index];
 
-    if (!group) {
+    if (!sheet) {
       continue;
     }
 
     onProgress?.(
-      `Reading statement table ${index + 1} of ${groups.length}…`,
+      `Reader V4: reading sheet ${index + 1} of ${sheets.length}…`,
     );
+
+    const detected =
+      findColumns(
+        sheet.rows,
+      ).columns;
+
+    if (
+      detected !== null
+    ) {
+      inheritedColumns =
+        detected;
+    }
+
+    const activeColumns =
+      detected ??
+      inheritedColumns;
 
     const repairedRows =
       repairShiftedAmountBalanceRows(
-        group.rows,
-        group.columns,
+        sheet.rows,
+        activeColumns,
       );
 
     const core =
       parseStatementRows(
         repairedRows,
-        group.columns,
+        activeColumns,
       );
 
-    combined.push(
+    results.push(
       combinedFromCore(
         core,
         repairedRows.length,
@@ -2024,7 +1817,7 @@ function parseWorkbook(
   }
 
   return mergeCombined(
-    combined,
+    results,
   );
 }
 
@@ -2052,7 +1845,7 @@ export async function extractFromFile(
 
   if (isImage) {
     onProgress?.(
-      "Reading scanned statement image…",
+      "Reader V4: reading statement image…",
     );
 
     const image =
@@ -2079,7 +1872,9 @@ export async function extractFromFile(
       );
     }
 
-    return fromText(text);
+    return fromText(
+      text,
+    );
   }
 
   if (
@@ -2105,7 +1900,7 @@ export async function extractFromFile(
     )
   ) {
     onProgress?.(
-      "Opening spreadsheet…",
+      "Reader V4: opening spreadsheet…",
     );
 
     let sheets:
@@ -2135,7 +1930,7 @@ export async function extractFromFile(
   }
 
   onProgress?.(
-    "Reading text statement…",
+    "Reader V4: reading text statement…",
   );
 
   let text: string;
@@ -2155,5 +1950,7 @@ export async function extractFromFile(
     );
   }
 
-  return fromText(text);
+  return fromText(
+    text,
+  );
 }
